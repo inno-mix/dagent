@@ -71,10 +71,19 @@ No async, no I/O — trivially unit- and property-testable, and enforced by
 - `agent.py` — the `Agent` `Protocol` (`async def run(ctx) -> Output`) and
   `AgentContext` (resolved inputs, `run_id`/`node_id`, injected `Clock`, model client
   factory, `Budget` handle). Context is how we keep agents pure and replayable.
-- `registry.py` — name → agent factory, populated by a `@register("name")` decorator.
+- `clock.py` — the `Clock` `Protocol` (`now`, `sleep`) with `SystemClock` for production
+  and `ManualClock` for tests. `SystemClock` is the only code in the package that touches
+  real time.
+- `registry.py` — name → agent *factory*, populated by a `@register("name")` decorator.
+  Factories rather than instances, so each node gets a fresh agent and one node's state
+  cannot leak into another's. Registries are ordinary objects the executor takes by
+  injection; the module-level `default_registry` is a convenience nothing in the engine
+  depends on. Re-registering a name raises rather than silently replacing — otherwise a
+  workflow's behaviour would depend on import order.
 - `executor.py` — the scheduler. Owns the run loop, the ready-set recomputation, the
   concurrency permits, and the handoff to the policy layer. This is the heart of the
-  project; keep it under tight test.
+  project; keep it under tight test. `run_id` is supplied by the caller rather than
+  minted here, so no run depends on an id it cannot reproduce.
 
 ### Policy (`dagent/policy`)
 - `retry.py` — attempts, exponential backoff with full jitter, retryable-error
@@ -84,10 +93,21 @@ No async, no I/O — trivially unit- and property-testable, and enforced by
   `Budget` tracks tokens/cost and refuses admission past the ceiling.
 
 ### Store (`dagent/store`)
-`StateStore` `Protocol`: `save_node_state`, `load_run`, `append_output`,
+`StateStore` `Protocol`: `save_node_state`, `load_run`, `append_output`, `load_output`,
 `checkpoint`. Two impls: `memory.py` (v1, dict-backed) and `postgres.py` (v2,
 `asyncpg`). All durability semantics live behind this protocol so the executor is
 storage-agnostic.
+
+`load_output` is what lets the executor resolve a node's inputs *through the store*
+rather than from an in-process cache, keeping the store the single source of truth — and
+turning Phase 5's resume into a reload rather than a reconstruction. A missing run or
+output raises `StoreError` rather than returning `None`, because `None` is itself a legal
+output and absence has to be signalled out of band.
+
+Two ordering guarantees the executor makes and an implementation may rely on: run-level
+state is written before the first node starts, and a node's output is written *before*
+that node is marked `SUCCESS`, so a node found `SUCCESS` on reload always has an output
+to read.
 
 ### Agents (`dagent/agents`)
 Concrete implementations: `planner`, `researcher`, `synthesizer`, `critic`. These are
@@ -112,8 +132,15 @@ Loop:
    `SUCCESS`/`FAILED` and the output.
 3. `await` the first task to finish (`asyncio.wait(FIRST_COMPLETED)`), fold its result
    into `states`, then go to 1.
-4. Terminate when no nodes are `PENDING`/`READY`/`RUNNING`. Derive `RunState` from the
-   node states + budget outcome.
+4. Terminate when nothing is in flight *and* the ready set is empty. Derive `RunState`
+   from the node states + budget outcome.
+
+Step 4 is deliberately "no more progress is possible", not "no node is still `PENDING`".
+A node whose dependency failed never becomes ready, so it stays `PENDING` forever and a
+loop waiting for `PENDING` to empty would never exit. Phase 2 leaves such a node
+`PENDING` and ends the run `FAILED`; Phase 4's failure semantics decide whether it is
+instead marked `SKIPPED`, which is one of the three configurable modes and not something
+the scheduler should be choosing on its own.
 
 Fan-out is step 2 dispatching multiple ready nodes at once; fan-in is step 1
 re-detecting a node whose several deps just completed.

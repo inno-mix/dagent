@@ -11,17 +11,28 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
+from typing import TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 __all__ = [
     "TERMINAL_NODE_STATES",
     "TERMINAL_RUN_STATES",
+    "NodeOutput",
     "NodeState",
     "NodeStateRecord",
     "RunState",
     "RunStateRecord",
 ]
+
+NodeOutput: TypeAlias = JsonValue
+"""Whatever an agent returns.
+
+Typed as JSON rather than ``Any`` because FR-4 requires a *serializable* output and
+Phase 5 has to write these to Postgres. Making that a type error today is cheaper than
+discovering it at the storage boundary later; an agent holding a richer object calls
+``.model_dump()`` on the way out.
+"""
 
 
 class NodeState(StrEnum):
