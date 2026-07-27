@@ -1,0 +1,80 @@
+[project]
+name = "dagent"
+version = "0.1.0"
+description = "A durable, async DAG execution engine for multi-agent AI workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7",
+    "typer>=0.12",
+]
+
+# Deliberately absent until the phase that calls for them (AGENTS.md §7):
+#   httpx / structlog / opentelemetry (Phase 3, 7), asyncpg (Phase 5), redis (Phase 8).
+# No model SDK and no orchestration framework will ever appear here outside `agents/`
+# — tests/test_isolation.py fails the build if one does.
+
+[project.scripts]
+dagent = "dagent.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "hypothesis>=6.100",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dagent"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "F",     # pyflakes
+    "W",     # pycodestyle warnings
+    "I",     # import sorting
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # bugbear
+    "SIM",   # simplify
+    "C4",    # comprehensions
+    "ASYNC", # blocking calls in async code (AGENTS.md §5)
+    "RUF",
+    "D",     # docstrings on public symbols (AGENTS.md §5)
+]
+ignore = [
+    "D203", # incompatible with D211, which we keep
+    "D213", # incompatible with D212, which we keep
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"] # test names are the documentation
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+addopts = "-q --strict-markers --strict-config"
+
+[tool.coverage.run]
+source = ["dagent"]
+branch = true

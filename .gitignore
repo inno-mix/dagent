@@ -1,0 +1,22 @@
+# AGENTS.md §7: never commit generated artifacts, .env, coverage reports, or .venv.
+.venv/
+.env
+
+__pycache__/
+*.py[cod]
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+dist/
+build/
+*.egg-info/
+
+.DS_Store
