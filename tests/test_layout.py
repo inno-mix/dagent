@@ -40,3 +40,9 @@ def test_module_named_in_agents_md_exists_and_imports(module: str) -> None:
 def test_package_ships_type_information() -> None:
     # AGENTS.md §5 makes typing mandatory; py.typed is what makes it visible downstream.
     assert (PACKAGE_ROOT / "py.typed").is_file()
+
+
+def test_tests_mirror_the_package_layout() -> None:
+    tests_root = pathlib.Path(__file__).parent
+    for package in ("models", "graph"):
+        assert (tests_root / package).is_dir(), f"tests/{package}/ should mirror dagent/{package}/"

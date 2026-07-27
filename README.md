@@ -16,9 +16,11 @@ See [`docs/SPEC.md`](docs/SPEC.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.m
 
 Under construction, phase by phase, against [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
-- **Phase 0 — Scaffold.** Done: the repo lints, type-checks, and tests from an empty
-  shell, with the package skeleton and the error hierarchy in place.
-- **Phase 1 — Workflow model + validation.** Next.
+- **Phase 0 — Scaffold.** Done.
+- **Phase 1 — Workflow model + validation.** Done: frozen `Workflow`/`Node`/`Policy`
+  schemas, the `NodeState`/`RunState` records, cycle detection that reports the offending
+  path, input-satisfaction and unknown-agent checks, `ready_set`, and a typed builder.
+- **Phase 2 — In-memory async executor.** Next.
 
 ## Quick start
 
@@ -26,6 +28,27 @@ Under construction, phase by phase, against [`docs/ROADMAP.md`](docs/ROADMAP.md)
 uv sync
 uv run pytest
 ```
+
+```python
+from dagent.graph import WorkflowBuilder, ready_set
+from dagent.models import NodeState
+
+workflow = (
+    WorkflowBuilder("diamond")
+    .add_node("plan", "fake")
+    .add_node("research_a", "fake", inputs={"topic": "plan"})
+    .add_node("research_b", "fake", inputs={"topic": "plan"})
+    .add_node("synthesize", "fake", inputs={"a": "research_a", "b": "research_b"})
+    .build()
+)
+
+states = {node.id: NodeState.PENDING for node in workflow.nodes}
+ready_set(workflow, states)  # ("plan",)
+```
+
+An `inputs` entry both feeds a node and makes it wait: the builder adds each input's
+source to that node's dependencies, and validation rejects any input that reads from a
+node the reader does not wait for, because that is a race.
 
 ## Development
 
