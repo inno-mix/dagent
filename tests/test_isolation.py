@@ -38,6 +38,27 @@ MODEL_SDKS = frozenset(
     }
 )
 
+# The same SDKs under their PyPI distribution names, which are not always the import
+# name: `google-genai` installs `google.genai`, so matching import names alone would let
+# the Gemini SDK into the base install unnoticed.
+MODEL_SDK_DISTRIBUTIONS = frozenset(
+    {
+        "anthropic",
+        "boto3",
+        "cohere",
+        "google-cloud-aiplatform",
+        "google-genai",
+        "google-generativeai",
+        "groq",
+        "litellm",
+        "mistralai",
+        "ollama",
+        "openai",
+        "replicate",
+        "transformers",
+    }
+)
+
 # Nothing may import these, agents included. The point of the project is that the
 # engine was built, not glued (DR-2).
 ORCHESTRATION_FRAMEWORKS = frozenset(
@@ -93,6 +114,11 @@ def _banned_match(module: str, banned: frozenset[str]) -> str | None:
     return None
 
 
+def _requirement_name(requirement: str) -> str:
+    """Strip version specifiers and extras from a requirement string."""
+    return re.split(r"[<>=!~\[; ]", requirement, maxsplit=1)[0].strip().lower()
+
+
 def _declared_requirements() -> list[str]:
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     requirements: list[str] = list(data["project"]["dependencies"])
@@ -141,14 +167,24 @@ def test_no_module_imports_an_orchestration_framework(path: pathlib.Path) -> Non
 def test_no_model_sdk_is_declared_as_a_dependency() -> None:
     # A model SDK belongs to an agent's optional extra, never to the base install.
     for requirement in _declared_requirements():
-        name = re.split(r"[<>=!~\[; ]", requirement, maxsplit=1)[0].strip().lower()
+        name = _requirement_name(requirement)
+        assert name not in MODEL_SDK_DISTRIBUTIONS, f"{requirement!r} is a model SDK"
         assert _banned_match(name, MODEL_SDKS) is None, f"{requirement!r} is a model SDK"
+
+
+def test_the_dependency_guard_knows_the_gemini_sdk_under_both_its_names() -> None:
+    # google-genai on PyPI, google.genai on import. Miss either and the SDK the agents
+    # will actually use is the one SDK the guard cannot see.
+    assert _requirement_name("google-genai>=1.0") in MODEL_SDK_DISTRIBUTIONS
+    assert _banned_match("google.genai", MODEL_SDKS) == "google.genai"
+    assert _banned_match("google.genai.types", MODEL_SDKS) == "google.genai"
+    # ...without banning every package that happens to live under `google`.
+    assert _banned_match("google.protobuf", MODEL_SDKS) is None
 
 
 def test_no_orchestration_framework_is_declared_as_a_dependency() -> None:
     for requirement in _declared_requirements():
-        name = re.split(r"[<>=!~\[; ]", requirement, maxsplit=1)[0].strip().lower()
-        name = name.replace("-", "_")
+        name = _requirement_name(requirement).replace("-", "_")
         assert _banned_match(name, ORCHESTRATION_FRAMEWORKS) is None, (
             f"{requirement!r} is an orchestration framework"
         )

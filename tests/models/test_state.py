@@ -125,4 +125,4 @@ def test_records_are_frozen() -> None:
 
 def test_records_reject_unknown_fields() -> None:
     with pytest.raises(PydanticValidationError):
-        NodeStateRecord(run_id="run-1", node_id="a", provider="openai")  # type: ignore[call-arg]
+        NodeStateRecord(run_id="run-1", node_id="a", provider="gemini")  # type: ignore[call-arg]
