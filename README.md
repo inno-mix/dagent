@@ -1,8 +1,6 @@
-<!-- Badges — fill in once the GitHub repo exists, e.g.:
-[![CI](https://github.com/<owner>/dagent/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/dagent/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/<owner>/dagent)](LICENSE)
+[![CI](https://github.com/inno-mix/dagent/actions/workflows/ci.yml/badge.svg)](https://github.com/inno-mix/dagent/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/inno-mix/dagent)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
--->
 
 # Dagent
 
@@ -90,7 +88,7 @@ scaling path live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 Requires Python 3.11+ and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
-git clone <repo-url>   # placeholder — fill in once the GitHub repo exists
+git clone https://github.com/inno-mix/dagent.git
 cd dagent
 uv sync                # installs into .venv from pyproject.toml / uv.lock
 cp .env.example .env   # then fill in provider keys once Phase 3 needs them
@@ -184,4 +182,4 @@ project is built against — module boundaries, testing rules, and commit style.
 
 ## License
 
-<!-- placeholder — add a LICENSE file and name it here once the GitHub repo exists -->
+MIT — see [`LICENSE`](LICENSE) for details.
