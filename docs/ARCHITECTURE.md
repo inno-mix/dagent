@@ -37,10 +37,21 @@ graph is terminal.
 ## 2. Components
 
 ### Models (`dagent/models`)
-Frozen pydantic v2 schemas — no logic. `Workflow`, `Node`, `Policy`, and the state
-records `NodeStateRecord`, `RunStateRecord`. Two enums that must never be conflated:
+Frozen pydantic v2 schemas — no logic. `Workflow`, `Node`, `Policy`, the state records
+`NodeStateRecord`, `RunStateRecord`, and the model-I/O records `ModelRequest`,
+`ModelResponse`, `ModelCallRecord`. Two enums that must never be conflated:
 `NodeState {PENDING, READY, RUNNING, SUCCESS, FAILED, SKIPPED}` and
 `RunState {PENDING, RUNNING, SUCCEEDED, FAILED, BUDGET_EXCEEDED, CANCELLED}`.
+
+A node carries two kinds of data and the distinction matters: `inputs` is what other
+nodes produced, `params` is what the author wrote down. `params` is what lets a workflow
+have a source at all — every other node is fed from upstream, so something has to supply
+the first value — and it is how a Phase 6 planner will hand each node it generates its
+own subtopic. It is part of the frozen definition, so it is identical on every replay.
+
+`NodeOutput` is `pydantic.JsonValue` rather than `Any`: FR-4 requires a *serializable*
+output and Phase 5 has to write these to Postgres, so the constraint is cheaper enforced
+at the type level today than discovered at the storage boundary later.
 
 ### Graph (`dagent/graph`)
 Pure functions over a `Workflow`.
@@ -74,6 +85,15 @@ No async, no I/O — trivially unit- and property-testable, and enforced by
 - `clock.py` — the `Clock` `Protocol` (`now`, `sleep`) with `SystemClock` for production
   and `ManualClock` for tests. `SystemClock` is the only code in the package that touches
   real time.
+- `model.py` — the `ModelClient` `Protocol` (one method, `complete`), plus
+  `NullModelClient` (refuses loudly, so a run with no provider fails with a sentence
+  rather than an `AttributeError`) and `StubModelClient` (scripted, for tests). Provider
+  -agnostic and HTTP-free: a concrete provider lives in `agents/`.
+- `recording.py` — `RecordingModelClient`, which wraps any client and writes every
+  request/response into the run record keyed by `(run_id, node_id, attempt, sequence)`.
+  That key is what a replay client will look calls up by. The wrapper is per-node and
+  cheap; the client it wraps is shared for the whole run, which is how "one shared
+  `httpx.AsyncClient`, never per-call" survives being wrapped.
 - `registry.py` — name → agent *factory*, populated by a `@register("name")` decorator.
   Factories rather than instances, so each node gets a fresh agent and one node's state
   cannot leak into another's. Registries are ordinary objects the executor takes by
@@ -110,9 +130,32 @@ that node is marked `SUCCESS`, so a node found `SUCCESS` on reload always has an
 to read.
 
 ### Agents (`dagent/agents`)
-Concrete implementations: `planner`, `researcher`, `synthesizer`, `critic`. These are
-the *only* modules allowed to import a model SDK. Each is small and independently
-testable with a fake model client.
+Concrete implementations: `planner`, `researcher`, `synthesizer`, `critic` — plus the
+provider clients they talk through, and the no-I/O fakes (`constant`, `echo`, `fake`).
+These are the *only* modules allowed to import a model SDK, or to know a vendor's name at
+all. Each is small and independently testable with a fake model client.
+
+`gemini.py` is the v1 provider, written against the REST endpoint over `httpx` rather
+than a vendor SDK: the surface it needs is one POST, so going direct keeps the dependency
+list honest and the wire format visible in the code instead of behind a client library.
+Keys come from the environment and nowhere else.
+
+Importing the package registers its agents on `default_registry` under the names a
+workflow file uses. `FailingAgent` is deliberately *not* registered — a workflow should
+never be able to name it by accident.
+
+### Loading (`dagent/loader.py`)
+FR-1 wants workflows definable in Python *and* in a file. `load_workflow` parses YAML and
+builds through `WorkflowBuilder`, so files get no separate rulebook — the same validator
+runs on both paths. It lives at the package root rather than in `graph/` because reading
+a file is I/O and `graph/` is proven pure by `tests/graph/test_purity.py`; parsing
+(`load_workflow`, pure, takes text) is split from reading (`load_workflow_file`) for the
+same reason.
+
+**Stack note (AGENTS.md §4):** this adds `pyyaml` to the dependency list. It is the
+minimum needed to satisfy FR-1's "loadable from YAML", it is used only through
+`safe_load` so a workflow file can never construct arbitrary Python, and it is confined
+to this one module.
 
 ### Observability (`dagent/observability`)
 OpenTelemetry setup, metric definitions, and `structlog` configuration. Executor and

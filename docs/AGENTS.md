@@ -150,6 +150,7 @@ dagent/
   agents/        # concrete LLM agents (planner/researcher/synthesizer/critic)
   observability/ # tracing, metrics, structured logging setup
   errors.py      # exception hierarchy
+  loader.py      # YAML workflow files -> Workflow (I/O, so not in the pure graph/)
   cli.py         # typer entrypoint
 tests/           # mirrors the package layout
 examples/        # sample workflow definitions (yaml)

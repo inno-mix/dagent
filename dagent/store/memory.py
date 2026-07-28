@@ -7,7 +7,10 @@ arrives in Phase 5 behind the same protocol (DR-3).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from dagent.errors import StoreError
+from dagent.models.model_call import ModelCallRecord
 from dagent.models.state import NodeOutput, NodeStateRecord, RunStateRecord
 
 __all__ = ["InMemoryStateStore"]
@@ -24,6 +27,7 @@ class InMemoryStateStore:
         """Start empty."""
         self._runs: dict[str, RunStateRecord] = {}
         self._outputs: dict[tuple[str, str], NodeOutput] = {}
+        self._model_calls: dict[str, list[ModelCallRecord]] = {}
 
     async def checkpoint(self, run: RunStateRecord) -> None:
         """Write run-level state, replacing the stored record entirely."""
@@ -50,6 +54,16 @@ class InMemoryStateStore:
             return self._outputs[run_id, node_id]
         except KeyError:
             raise StoreError(f"run {run_id!r} has no output for node {node_id!r}") from None
+
+    async def append_model_call(self, record: ModelCallRecord) -> None:
+        """Record one model call made during this run."""
+        self._require_run(record.run_id)
+        self._model_calls.setdefault(record.run_id, []).append(record)
+
+    async def load_model_calls(self, run_id: str) -> Sequence[ModelCallRecord]:
+        """Return every model call made during a run, in the order they were made."""
+        self._require_run(run_id)
+        return tuple(self._model_calls.get(run_id, ()))
 
     def _require_run(self, run_id: str) -> RunStateRecord:
         try:

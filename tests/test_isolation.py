@@ -151,6 +151,19 @@ def test_core_module_imports_no_model_sdk(path: pathlib.Path) -> None:
     )
 
 
+@pytest.mark.parametrize("path", CORE_FILES, ids=_ids(CORE_FILES))
+def test_core_module_makes_no_http_calls(path: pathlib.Path) -> None:
+    # Stronger than "no model SDK": nothing outside agents/ should be talking to a
+    # provider at all. If HTTP appears in the core, a vendor has leaked in without
+    # needing an SDK to do it.
+    offenders = sorted(_imported_modules(path) & {"httpx", "requests", "aiohttp", "urllib3"})
+
+    assert not offenders, (
+        f"{path.relative_to(REPO_ROOT)} imports {offenders}; provider transport belongs "
+        "in dagent/agents/ (AGENTS.md rule 3, §4)."
+    )
+
+
 @pytest.mark.parametrize("path", ALL_FILES, ids=_ids(ALL_FILES))
 def test_no_module_imports_an_orchestration_framework(path: pathlib.Path) -> None:
     offenders = {

@@ -9,11 +9,12 @@ run replayable and a test network-free (DR-5).
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from dagent.models.state import NodeOutput
 from dagent.runtime.clock import Clock
+from dagent.runtime.model import ModelClient, NullModelClient
 
 __all__ = ["Agent", "AgentContext"]
 
@@ -26,8 +27,8 @@ class AgentContext:
     objects like the clock, which are behaviour rather than data and have no business
     being validated or serialized.
 
-    Later phases widen this rather than reshape it — the model client lands in Phase 3
-    and the budget handle in Phase 4, both as further injected seams.
+    Later phases widen this rather than reshape it — the budget handle lands in Phase 4
+    as a further injected seam.
     """
 
     run_id: str
@@ -35,6 +36,15 @@ class AgentContext:
     attempt: int
     inputs: Mapping[str, NodeOutput]
     clock: Clock
+    params: Mapping[str, NodeOutput] = field(default_factory=dict)
+    """This node's static configuration, copied straight from its definition."""
+    model: ModelClient = field(default_factory=NullModelClient)
+    """The model seam.
+
+    Always present, so an agent never branches on ``None``. A run that wires no model
+    gets a client that refuses loudly, which turns "forgot to configure a provider" into
+    a clear error rather than a crash inside agent code.
+    """
 
 
 class Agent(Protocol):

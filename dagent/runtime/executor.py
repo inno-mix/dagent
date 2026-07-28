@@ -28,6 +28,8 @@ from dagent.models.state import (
 from dagent.models.workflow import Node, Workflow
 from dagent.runtime.agent import AgentContext
 from dagent.runtime.clock import Clock, SystemClock
+from dagent.runtime.model import ModelClient, NullModelClient
+from dagent.runtime.recording import RecordingModelClient
 from dagent.runtime.registry import AgentRegistry
 from dagent.store.base import StateStore
 
@@ -51,11 +53,18 @@ class Executor:
         registry: AgentRegistry,
         store: StateStore,
         clock: Clock | None = None,
+        model: ModelClient | None = None,
     ) -> None:
-        """Wire the executor to its agents, its storage, and its source of time."""
+        """Wire the executor to its agents, storage, source of time, and model provider.
+
+        One ``model`` client is shared by the whole run (AGENTS.md §4: never a client per
+        call). Each node gets a thin recording wrapper around it, not a connection of its
+        own. Omit it and agents that try to call a model fail with a clear message.
+        """
         self._registry = registry
         self._store = store
         self._clock: Clock = clock if clock is not None else SystemClock()
+        self._model: ModelClient = model if model is not None else NullModelClient()
 
     async def run(self, workflow: Workflow, *, run_id: str) -> RunStateRecord:
         """Execute every node in the workflow and return the final run state.
@@ -125,7 +134,18 @@ class Executor:
                     node_id=node.id,
                     attempt=_FIRST_ATTEMPT,
                     inputs=inputs,
+                    params=node.params,
                     clock=self._clock,
+                    # Per-node wrapper, shared underlying client: every model call this
+                    # node makes lands in the run record for replay (FR-8).
+                    model=RecordingModelClient(
+                        self._model,
+                        store=self._store,
+                        run_id=run_id,
+                        node_id=node.id,
+                        attempt=_FIRST_ATTEMPT,
+                        clock=self._clock,
+                    ),
                 )
             )
         except Exception as exc:

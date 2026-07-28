@@ -16,6 +16,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from dagent.errors import ValidationError
 from dagent.graph.validate import validate
+from dagent.models.state import NodeOutput
 from dagent.models.workflow import Node, Policy, Workflow
 
 __all__ = ["WorkflowBuilder"]
@@ -36,6 +37,7 @@ class WorkflowBuilder:
         *,
         depends_on: Sequence[str] = (),
         inputs: Mapping[str, str] | None = None,
+        params: Mapping[str, NodeOutput] | None = None,
         policy: Policy | None = None,
     ) -> Self:
         """Add a node, returning ``self`` so calls chain.
@@ -49,6 +51,8 @@ class WorkflowBuilder:
             agent: The registered agent name that will execute it.
             depends_on: Nodes to wait for whose output this node does not read.
             inputs: Local name → the id of the upstream node supplying it.
+            params: Static configuration for the node, written by the author rather than
+                produced upstream.
             policy: Optional per-node retry/timeout override.
 
         Returns:
@@ -68,6 +72,7 @@ class WorkflowBuilder:
                 agent=agent,
                 depends_on=tuple(edges),
                 inputs=resolved_inputs,
+                params=dict(params or {}),
                 policy=policy,
             )
         except PydanticValidationError as exc:

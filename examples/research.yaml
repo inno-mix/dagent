@@ -1,0 +1,36 @@
+# Two real agents behind one contract: research two topics in parallel, then merge.
+#
+#   uv run --env-file .env dagent run examples/research.yaml
+#
+# The two researchers are independent, so the executor dispatches them together and the
+# synthesizer waits for both. The seeds are `constant` nodes because something has to be
+# the source of a graph whose every other node is fed from upstream — in Phase 6 a
+# planner takes over deciding what those values are, and how many of them there are.
+name: research
+
+nodes:
+  - id: seed_attention
+    agent: constant
+    params:
+      value: the attention mechanism in transformer models
+
+  - id: seed_rlhf
+    agent: constant
+    params:
+      value: reinforcement learning from human feedback for aligning language models
+
+  - id: research_attention
+    agent: researcher
+    inputs:
+      topic: seed_attention
+
+  - id: research_rlhf
+    agent: researcher
+    inputs:
+      topic: seed_rlhf
+
+  - id: synthesis
+    agent: synthesizer
+    inputs:
+      attention: research_attention
+      rlhf: research_rlhf

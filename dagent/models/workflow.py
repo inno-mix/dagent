@@ -13,6 +13,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from dagent.models.state import NodeOutput
+
 __all__ = ["Node", "NodeId", "Policy", "Workflow"]
 
 NodeId = Annotated[
@@ -67,6 +69,14 @@ class Node(BaseModel):
     agent: str = Field(min_length=1)
     depends_on: tuple[NodeId, ...] = ()
     inputs: Mapping[str, NodeId] = Field(default_factory=dict)
+    params: Mapping[str, NodeOutput] = Field(default_factory=dict)
+    """Static configuration for this node, handed to the agent alongside its inputs.
+
+    Where ``inputs`` carries data produced by other nodes, ``params`` carries data the
+    author wrote down: the topic a researcher is asked about, a threshold, a style. It is
+    part of the frozen definition, so it is identical on every replay — and it is how a
+    Phase 6 planner will hand each generated node its own subtopic.
+    """
     policy: Policy | None = None
 
 

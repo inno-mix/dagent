@@ -13,8 +13,10 @@ Two ordering rules an implementation may rely on, and the executor guarantees:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
+from dagent.models.model_call import ModelCallRecord
 from dagent.models.state import NodeOutput, NodeStateRecord, RunStateRecord
 
 __all__ = ["StateStore"]
@@ -57,4 +59,16 @@ class StateStore(Protocol):
         is what keeps the store the single source of truth — and is what makes Phase 5's
         resume a matter of reloading rather than reconstructing.
         """
+        ...
+
+    async def append_model_call(self, record: ModelCallRecord) -> None:
+        """Record one model call made during this run.
+
+        Appends rather than replaces: a node may call a model several times, and every
+        call has to survive for a replay to reproduce the run (FR-8).
+        """
+        ...
+
+    async def load_model_calls(self, run_id: str) -> Sequence[ModelCallRecord]:
+        """Return every model call made during a run, in the order they were made."""
         ...

@@ -7,12 +7,15 @@ required to be network-free (AGENTS.md §6).
 
 from __future__ import annotations
 
+from dagent.errors import AgentError
 from dagent.models.state import NodeOutput
 from dagent.runtime.agent import AgentContext
+from dagent.runtime.registry import register
 
-__all__ = ["EchoAgent", "FailingAgent", "FakeAgent"]
+__all__ = ["ConstantAgent", "EchoAgent", "FailingAgent", "FakeAgent"]
 
 
+@register("fake")
 class FakeAgent:
     """Returns a deterministic record of what it was given.
 
@@ -31,6 +34,29 @@ class FakeAgent:
         }
 
 
+@register("constant")
+class ConstantAgent:
+    """Emits its ``value`` parameter unchanged — how a workflow gets its seed data.
+
+    Every other node's data comes from upstream; something has to be the source, and this
+    is it. In Phase 6 the planner takes over the job of deciding what those values are.
+    """
+
+    async def run(self, ctx: AgentContext) -> NodeOutput:
+        """Return the node's ``value`` parameter.
+
+        Raises:
+            AgentError: If the node declares no ``value`` parameter.
+        """
+        if "value" not in ctx.params:
+            raise AgentError(
+                f"constant node {ctx.node_id!r} needs a 'value' parameter, "
+                f"got params {sorted(ctx.params)}"
+            )
+        return ctx.params["value"]
+
+
+@register("echo")
 class EchoAgent:
     """Passes a single input straight through, or emits ``None`` if it has none."""
 
@@ -43,7 +69,11 @@ class EchoAgent:
 
 
 class FailingAgent:
-    """Always raises. Used to exercise the failure path without a flaky real agent."""
+    """Always raises. Used to exercise the failure path without a flaky real agent.
+
+    Deliberately *not* registered: a workflow should never be able to name this by
+    accident, so tests wire it explicitly into a registry of their own.
+    """
 
     async def run(self, ctx: AgentContext) -> NodeOutput:
         """Raise, naming the node so the recorded error is traceable."""

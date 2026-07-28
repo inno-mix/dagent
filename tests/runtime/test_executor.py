@@ -1,6 +1,7 @@
 """Phase 2 acceptance plus the executor's failure, cancellation, and ordering behaviour."""
 
 import asyncio
+from collections.abc import Sequence
 from datetime import datetime
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from dagent.agents.fake import FailingAgent, FakeAgent
 from dagent.errors import ValidationError
 from dagent.graph.builder import WorkflowBuilder
+from dagent.models.model_call import ModelCallRecord
 from dagent.models.state import NodeOutput, NodeState, RunState, RunStateRecord
 from dagent.models.workflow import Node, Workflow
 from dagent.runtime.agent import Agent, AgentContext
@@ -73,6 +75,13 @@ class SpyStore:
 
     async def load_output(self, run_id: str, node_id: str) -> NodeOutput:
         return await self.inner.load_output(run_id, node_id)
+
+    async def append_model_call(self, record: ModelCallRecord) -> None:
+        self.events.append(("model", record.node_id, str(record.sequence)))
+        await self.inner.append_model_call(record)
+
+    async def load_model_calls(self, run_id: str) -> Sequence[ModelCallRecord]:
+        return await self.inner.load_model_calls(run_id)
 
     def for_node(self, node_id: str) -> list[str]:
         return [f"{kind}:{detail}" for kind, target, detail in self.events if target == node_id]

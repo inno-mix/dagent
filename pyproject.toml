@@ -7,10 +7,12 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.7",
     "typer>=0.12",
+    "httpx>=0.27",  # AGENTS.md §4: the HTTP client for provider calls (Phase 3)
+    "pyyaml>=6.0",  # FR-1 workflow files; see the note in ARCHITECTURE.md §2
 ]
 
 # Deliberately absent until the phase that calls for them (AGENTS.md §7):
-#   httpx / structlog / opentelemetry (Phase 3, 7), asyncpg (Phase 5), redis (Phase 8).
+#   structlog / opentelemetry (Phase 7), asyncpg (Phase 5), redis (Phase 8).
 # No model SDK and no orchestration framework will ever appear here outside `agents/`
 # — tests/test_isolation.py fails the build if one does.
 
@@ -25,6 +27,7 @@ dev = [
     "hypothesis>=6.100",
     "ruff>=0.5",
     "mypy>=1.10",
+    "types-PyYAML>=6.0",
 ]
 
 [build-system]
