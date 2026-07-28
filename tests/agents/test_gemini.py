@@ -298,3 +298,66 @@ async def test_an_owned_http_client_is_closed_on_context_exit() -> None:
 
     with pytest.raises(RuntimeError):
         await client.complete(ModelRequest(prompt="hi"))
+
+
+@pytest.mark.parametrize("status", [429, 408, 500, 503], ids=str)
+@pytest.mark.asyncio
+async def test_a_transient_status_is_marked_retryable(status: int) -> None:
+    # 429 and 5xx are the provider having a moment; another attempt may well work.
+    with pytest.raises(AgentError) as caught:
+        await client_with(always({"error": "later"}, status=status)).complete(
+            ModelRequest(prompt="hi")
+        )
+
+    assert caught.value.retryable is True
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404], ids=str)
+@pytest.mark.asyncio
+async def test_a_permanent_status_is_not_retried(status: int) -> None:
+    # A bad key or a malformed body is exactly as wrong on the third attempt.
+    with pytest.raises(AgentError) as caught:
+        await client_with(always({"error": "no"}, status=status)).complete(
+            ModelRequest(prompt="hi")
+        )
+
+    assert caught.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_a_transport_failure_is_retryable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host")
+
+    with pytest.raises(AgentError) as caught:
+        await client_with(handler).complete(ModelRequest(prompt="hi"))
+
+    assert caught.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_prompt_is_not_retried() -> None:
+    # The filter is a property of the prompt, so the next attempt is filtered too.
+    body = {"candidates": [], "promptFeedback": {"blockReason": "SAFETY"}}
+
+    with pytest.raises(AgentError) as caught:
+        await client_with(always(body)).complete(ModelRequest(prompt="hi"))
+
+    assert caught.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_an_empty_completion_is_not_retried() -> None:
+    body = {"candidates": [{"content": {"parts": []}, "finishReason": "MAX_TOKENS"}]}
+
+    with pytest.raises(AgentError) as caught:
+        await client_with(always(body)).complete(ModelRequest(prompt="hi"))
+
+    assert caught.value.retryable is False
+
+
+def test_a_missing_key_is_not_retried() -> None:
+    with pytest.raises(AgentError) as caught:
+        GeminiClient(api_key="")
+
+    assert caught.value.retryable is False

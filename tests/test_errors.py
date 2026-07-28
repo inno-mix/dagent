@@ -44,3 +44,17 @@ def test_validation_error_cycle_is_immutable() -> None:
     path.append("c")
 
     assert error.cycle == ("a", "b", "a")
+
+
+def test_an_agent_error_is_retryable_by_default() -> None:
+    # Most agent failures are a provider having a moment, so the default is the common
+    # case and a permanent failure has to say so.
+    assert AgentError("provider hiccup").retryable is True
+
+
+def test_an_agent_error_can_declare_itself_permanent() -> None:
+    assert AgentError("no such model", retryable=False).retryable is False
+
+
+def test_the_retryable_hint_does_not_disturb_the_message() -> None:
+    assert str(AgentError("boom", retryable=False)) == "boom"

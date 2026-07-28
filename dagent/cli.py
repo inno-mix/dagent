@@ -17,11 +17,13 @@ import typer
 
 import dagent.agents  # noqa: F401  — imported for the side effect of registering agents
 from dagent import __version__
-from dagent.errors import DagentError
+from dagent.errors import DagentError, PolicyError
 from dagent.graph.validate import validate as validate_graph
 from dagent.loader import load_workflow_file
 from dagent.models.state import NodeState, NodeStateRecord, RunState
 from dagent.models.workflow import Workflow
+from dagent.policy.limits import Budget, Limits
+from dagent.policy.run import FailureMode, RunPolicy
 from dagent.runtime.executor import Executor
 from dagent.runtime.model import ModelClient, NullModelClient, StubModelClient
 from dagent.runtime.registry import default_registry
@@ -74,17 +76,79 @@ def run(
         str, typer.Option(help="Model provider: 'gemini', 'stub' for a dry run, or 'none'.")
     ] = "gemini",
     show_outputs: Annotated[bool, typer.Option(help="Print each node's output.")] = True,
+    max_concurrency: Annotated[
+        int | None, typer.Option(help="Cap on nodes running at once. Default: unlimited.")
+    ] = None,
+    provider_concurrency: Annotated[
+        int | None, typer.Option(help="Cap on nodes per provider. Default: unlimited.")
+    ] = None,
+    max_tokens: Annotated[
+        int | None, typer.Option(help="Token ceiling for the whole run. Default: unlimited.")
+    ] = None,
+    on_failure: Annotated[
+        str,
+        typer.Option(help="run_to_completion | fail_fast | skip_downstream."),
+    ] = FailureMode.RUN_TO_COMPLETION.value,
 ) -> None:
     """Run a workflow end to end and report what each node did.
 
     Credentials come from the environment and nowhere else, so run this under
     ``uv run --env-file .env dagent run ...`` or export the key yourself.
+
+    Retries and timeouts are per node and come from the workflow file's ``policy`` block.
+    The options here are per run: they are how much of the machine, and of the budget,
+    this particular execution is allowed to use.
     """
     workflow = _load(workflow_file)
+    try:
+        policy = _run_policy(
+            max_concurrency=max_concurrency,
+            provider_concurrency=provider_concurrency,
+            max_tokens=max_tokens,
+            on_failure=on_failure,
+        )
+    except DagentError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2) from exc
+
     code = asyncio.run(
-        _execute(workflow, run_id=run_id, provider=provider, show_outputs=show_outputs)
+        _execute(
+            workflow,
+            run_id=run_id,
+            provider=provider,
+            show_outputs=show_outputs,
+            policy=policy,
+        )
     )
     raise typer.Exit(code)
+
+
+def _run_policy(
+    *,
+    max_concurrency: int | None,
+    provider_concurrency: int | None,
+    max_tokens: int | None,
+    on_failure: str,
+) -> RunPolicy:
+    """Assemble the run-level policy from the command line.
+
+    Raises:
+        PolicyError: If a cap is out of range or the failure mode is not one of the three.
+    """
+    try:
+        failure_mode = FailureMode(on_failure)
+    except ValueError as exc:
+        modes = ", ".join(mode.value for mode in FailureMode)
+        raise PolicyError(f"unknown failure mode {on_failure!r}; expected one of {modes}") from exc
+
+    return RunPolicy(
+        failure_mode=failure_mode,
+        limits=Limits(
+            max_concurrency=max_concurrency,
+            default_per_provider=provider_concurrency,
+        ),
+        budget=Budget(max_tokens=max_tokens),
+    )
 
 
 def _load(workflow_file: pathlib.Path) -> Workflow:
@@ -115,7 +179,14 @@ def _model_client(provider: str) -> ModelClient:
     raise DagentError(f"unknown provider {provider!r}; expected 'gemini', 'stub', or 'none'")
 
 
-async def _execute(workflow: Workflow, *, run_id: str, provider: str, show_outputs: bool) -> int:
+async def _execute(
+    workflow: Workflow,
+    *,
+    run_id: str,
+    provider: str,
+    show_outputs: bool,
+    policy: RunPolicy,
+) -> int:
     """Execute the workflow, print a report, and return the process exit code."""
     store = InMemoryStateStore()
 
@@ -126,9 +197,9 @@ async def _execute(workflow: Workflow, *, run_id: str, provider: str, show_outpu
         return 2
 
     try:
-        result = await Executor(registry=default_registry, store=store, model=client).run(
-            workflow, run_id=run_id
-        )
+        result = await Executor(
+            registry=default_registry, store=store, model=client, policy=policy
+        ).run(workflow, run_id=run_id)
     except DagentError as exc:
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
         return 2
@@ -147,6 +218,12 @@ async def _execute(workflow: Workflow, *, run_id: str, provider: str, show_outpu
     if calls:
         tokens = sum(call.response.total_tokens for call in calls)
         typer.echo(f"\n{len(calls)} model call(s), {tokens} token(s) recorded")
+
+    if policy.budget.refused:
+        typer.secho(
+            f"budget: {policy.budget.describe()} — {policy.budget.refusals} model call(s) refused",
+            fg=typer.colors.YELLOW,
+        )
 
     if show_outputs:
         await _print_outputs(store, result.run_id, result.nodes)

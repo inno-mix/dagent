@@ -46,9 +46,9 @@ Under construction, phase by phase, against [`docs/ROADMAP.md`](docs/ROADMAP.md)
 | 0 — Scaffold | Repo lints, type-checks, and tests from an empty shell | Done |
 | 1 — Workflow model + validation | Frozen `Workflow`/`Node`/`Policy` schemas, cycle detection, input-satisfaction checks, `ready_set`, typed builder | Done |
 | 2 — In-memory async executor | Run a fixed DAG concurrently, passing outputs along edges | Done |
-| 3 — Agent plugin interface | Real LLM agents behind a model-agnostic contract | Next |
-| 4 — Policy engine | Retries, timeouts, budgets, failure semantics | Planned |
-| 5 — Persistence + crash resume | Kill it mid-run, restart, get the same result | Planned |
+| 3 — Agent plugin interface | Real LLM agents behind a model-agnostic contract | Done |
+| 4 — Policy engine | Retries, timeouts, budgets, failure semantics | Done |
+| 5 — Persistence + crash resume | Kill it mid-run, restart, get the same result | Next |
 | 6 — Dynamic DAG expansion | A planner agent grows the graph at runtime | Planned |
 | 7 — Observability + run inspector | Tracing, metrics, and a CLI `inspect` command | Planned |
 | 8 — Capstone: distributed workers | Same core, Redis Streams transport, Postgres store | Planned |

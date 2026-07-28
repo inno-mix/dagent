@@ -19,18 +19,36 @@ nodes:
     params:
       value: reinforcement learning from human feedback for aligning language models
 
+  # The model-backed nodes carry a policy; the `constant` seeds do not need one, because
+  # nothing about reading a value off the definition can fail transiently. Three attempts
+  # with jittered backoff is what a provider's 429 or 503 costs you instead of a dead run.
   - id: research_attention
     agent: researcher
     inputs:
       topic: seed_attention
+    policy:
+      max_attempts: 3
+      backoff_initial_s: 1.0
+      backoff_max_s: 20.0
+      timeout_s: 120
 
   - id: research_rlhf
     agent: researcher
     inputs:
       topic: seed_rlhf
+    policy:
+      max_attempts: 3
+      backoff_initial_s: 1.0
+      backoff_max_s: 20.0
+      timeout_s: 120
 
   - id: synthesis
     agent: synthesizer
     inputs:
       attention: research_attention
       rlhf: research_rlhf
+    policy:
+      max_attempts: 3
+      backoff_initial_s: 1.0
+      backoff_max_s: 20.0
+      timeout_s: 180

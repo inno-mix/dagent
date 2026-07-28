@@ -1,0 +1,71 @@
+"""Run-level policy: failure semantics, and the bundle of knobs the executor is handed.
+
+Node-level policy (attempts, backoff, timeout) belongs to the *definition* and lives in
+:class:`~dagent.models.workflow.Policy`. Everything here belongs to the *run*: it is how
+this execution of the workflow behaves, not what the workflow is, so it is supplied at
+submit time and never frozen into the definition.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import StrEnum
+
+from dagent.models.workflow import Policy
+from dagent.policy.limits import Budget, Limits
+from dagent.policy.retry import Backoff, Retryable, default_retryable
+
+__all__ = ["FailureMode", "RunPolicy"]
+
+
+class FailureMode(StrEnum):
+    """What a node's failure does to the rest of the run (FR-5).
+
+    Three modes because the right answer genuinely depends on the workflow, and a
+    scheduler that picks one on its own is making a product decision it has no business
+    making. A batch of independent summaries wants every branch to finish; a pipeline
+    feeding a paid downstream step wants to stop the moment anything is wrong.
+    """
+
+    RUN_TO_COMPLETION = "run_to_completion"
+    """Let every independent branch finish. Nodes blocked by the failure stay ``PENDING``."""
+
+    FAIL_FAST = "fail_fast"
+    """Cancel everything still in flight and dispatch nothing further."""
+
+    SKIP_DOWNSTREAM = "skip_downstream"
+    """Finish independent branches, and mark the failure's descendants ``SKIPPED``.
+
+    Same execution as ``run_to_completion``; the difference is honesty in the record.
+    A node that can never become ready is reported as skipped rather than left looking
+    like work that is still to come.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class RunPolicy:
+    """Everything the executor needs to know about limits, retries, and failure.
+
+    Every default is deliberately inert: no cap, no ceiling, one attempt per node, no
+    timeout, independent branches allowed to finish. A run that passes no policy behaves
+    exactly as it did before the policy layer existed, so opting in to a limit is a
+    visible decision rather than an inherited surprise.
+
+    Frozen, but it holds two mutable objects — ``limits`` and ``budget`` accumulate state
+    across a run by design. Freezing the bundle stops the *configuration* changing
+    mid-run; the counters inside it are the run's own bookkeeping.
+    """
+
+    failure_mode: FailureMode = FailureMode.RUN_TO_COMPLETION
+    node_defaults: Policy = field(default_factory=Policy)
+    """Applied to any node that declares no ``policy`` of its own."""
+    limits: Limits = field(default_factory=Limits)
+    budget: Budget = field(default_factory=Budget)
+    backoff: Backoff = field(default_factory=Backoff)
+    retryable: Retryable = field(default=default_retryable)
+    """Decides whether a failed attempt earns another one. Swap it to change the rules
+    without touching the executor."""
+
+    def policy_for(self, override: Policy | None) -> Policy:
+        """Return the policy governing a node: its own override, or the run's default."""
+        return override if override is not None else self.node_defaults

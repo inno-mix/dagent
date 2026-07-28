@@ -29,6 +29,9 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_TIMEOUT = 60.0
 
+_RETRYABLE_STATUSES = frozenset({httpx.codes.REQUEST_TIMEOUT, httpx.codes.TOO_MANY_REQUESTS})
+"""Client-error statuses that are still worth another attempt — see ``_status_is_retryable``."""
+
 DEFAULT_THINKING_BUDGET = 0
 """Reasoning tokens allowed per call, defaulting to none.
 
@@ -75,7 +78,7 @@ class GeminiClient:
             AgentError: If the API key is empty.
         """
         if not api_key:
-            raise AgentError(f"a Gemini API key is required; set {API_KEY_ENV}")
+            raise AgentError(f"a Gemini API key is required; set {API_KEY_ENV}", retryable=False)
 
         self._api_key = api_key
         self._model = model
@@ -98,7 +101,8 @@ class GeminiClient:
         if not api_key:
             raise AgentError(
                 f"{API_KEY_ENV} is not set; copy .env.example to .env and fill it in, "
-                "then run under `uv run --env-file .env`"
+                "then run under `uv run --env-file .env`",
+                retryable=False,
             )
         return cls(
             api_key=api_key,
@@ -145,7 +149,8 @@ class GeminiClient:
         if response.status_code != httpx.codes.OK:
             # response.text can echo the request but never the key: it is a header.
             raise AgentError(
-                f"gemini returned HTTP {response.status_code}: {_truncate(response.text)}"
+                f"gemini returned HTTP {response.status_code}: {_truncate(response.text)}",
+                retryable=_status_is_retryable(response.status_code),
             )
 
         return _parse_response(response.json(), fallback_model=model)
@@ -174,13 +179,15 @@ def _parse_response(body: Any, *, fallback_model: str) -> ModelResponse:
     candidates = body.get("candidates") or []
     if not candidates:
         reason = body.get("promptFeedback", {}).get("blockReason", "no candidates returned")
-        raise AgentError(f"gemini produced no output: {reason}")
+        # A filtered prompt is a property of the prompt, so the same prompt is filtered
+        # again on the next attempt. Not worth the latency or the tokens.
+        raise AgentError(f"gemini produced no output: {reason}", retryable=False)
 
     parts = candidates[0].get("content", {}).get("parts") or []
     text = "".join(part.get("text", "") for part in parts)
     if not text:
         finish = candidates[0].get("finishReason", "unknown")
-        raise AgentError(f"gemini produced empty text (finishReason={finish})")
+        raise AgentError(f"gemini produced empty text (finishReason={finish})", retryable=False)
 
     usage = body.get("usageMetadata") or {}
     return ModelResponse(
@@ -190,6 +197,17 @@ def _parse_response(body: Any, *, fallback_model: str) -> ModelResponse:
         input_tokens=usage.get("promptTokenCount", 0),
         output_tokens=usage.get("candidatesTokenCount", 0),
     )
+
+
+def _status_is_retryable(status: int) -> bool:
+    """Whether another attempt at this request could plausibly succeed.
+
+    429 and 5xx are the provider having a moment, and 408 is a timeout; all three go away
+    on their own. Every other 4xx is the request itself being wrong — a bad key, a
+    malformed body, a model that does not exist — and it will be exactly as wrong on the
+    third attempt, so retrying only spends latency to reach the same error.
+    """
+    return status in _RETRYABLE_STATUSES or status >= httpx.codes.INTERNAL_SERVER_ERROR
 
 
 def _truncate(text: str, limit: int = 500) -> str:

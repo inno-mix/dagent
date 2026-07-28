@@ -43,7 +43,9 @@ class SynthesizerAgent:
         if not ctx.inputs:
             raise AgentError(
                 f"synthesizer node {ctx.node_id!r} has no inputs to merge; "
-                "it needs at least one upstream node"
+                "it needs at least one upstream node",
+                # A wiring mistake in the definition, identical on every attempt.
+                retryable=False,
             )
 
         sections = [

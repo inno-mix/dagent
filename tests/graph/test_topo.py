@@ -1,7 +1,13 @@
 import pytest
 
 from dagent.errors import ValidationError
-from dagent.graph.topo import node_dependencies, nodes_by_id, ready_set, topological_order
+from dagent.graph.topo import (
+    descendants,
+    node_dependencies,
+    nodes_by_id,
+    ready_set,
+    topological_order,
+)
 from dagent.models.state import NodeState
 from dagent.models.workflow import Node, Workflow
 
@@ -179,3 +185,69 @@ def test_topological_order_rejects_a_dangling_dependency() -> None:
 
     with pytest.raises(ValidationError, match="ghost"):
         topological_order(workflow)
+
+
+# --- descendants -------------------------------------------------------------------
+
+
+def test_descendants_of_a_leaf_are_empty(diamond: Workflow) -> None:
+    assert descendants(diamond, "d") == frozenset()
+
+
+def test_descendants_reach_the_whole_transitive_blast_radius(diamond: Workflow) -> None:
+    # A -> B, A -> C, B + C -> D: everything downstream of A is unreachable if A fails.
+    assert descendants(diamond, "a") == frozenset({"b", "c", "d"})
+
+
+def test_descendants_follow_only_the_forward_edges(diamond: Workflow) -> None:
+    assert descendants(diamond, "b") == frozenset({"d"})
+
+
+def test_a_node_is_not_its_own_descendant(diamond: Workflow) -> None:
+    assert "a" not in descendants(diamond, "a")
+
+
+def test_descendants_of_an_unknown_node_are_empty(diamond: Workflow) -> None:
+    # A caller asking about a node that is not in the graph wants an empty blast radius.
+    assert descendants(diamond, "ghost") == frozenset()
+
+
+def test_descendants_are_reached_through_a_diamond_only_once() -> None:
+    # D is reachable from A by two paths; visiting it twice would be a correctness bug in
+    # a bigger graph rather than just wasted work.
+    workflow = Workflow(
+        name="wide",
+        nodes=(
+            Node(id="a", agent="fake"),
+            Node(id="b", agent="fake", depends_on=("a",)),
+            Node(id="c", agent="fake", depends_on=("a",)),
+            Node(id="d", agent="fake", depends_on=("b", "c")),
+            Node(id="e", agent="fake", depends_on=("d",)),
+        ),
+    )
+
+    assert descendants(workflow, "a") == frozenset({"b", "c", "d", "e"})
+
+
+def test_an_ordering_only_edge_still_carries_the_blast_radius() -> None:
+    # depends_on without inputs is still a dependency: the waiter can never become ready.
+    workflow = Workflow(
+        name="ordered",
+        nodes=(Node(id="a", agent="fake"), Node(id="b", agent="fake", depends_on=("a",))),
+    )
+
+    assert descendants(workflow, "a") == frozenset({"b"})
+
+
+def test_descendants_ignores_an_edge_pointing_outside_the_graph() -> None:
+    # `descendants` runs on a graph the validator has already accepted, but it must not
+    # explode on one it has not: a dangling edge is someone else's error to report.
+    workflow = Workflow(
+        name="dangling",
+        nodes=(
+            Node(id="a", agent="fake"),
+            Node(id="b", agent="fake", depends_on=("a", "ghost")),
+        ),
+    )
+
+    assert descendants(workflow, "a") == frozenset({"b"})

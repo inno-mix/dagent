@@ -69,6 +69,9 @@ Pure functions over a `Workflow`.
   keep it O(edges).
 - `topological_order(workflow)` → all node ids in dependency order (Kahn, declaration
   order as the tiebreak).
+- `descendants(workflow, node_id)` → the blast radius of a failure: every node that can
+  never become ready once `node_id` fails. Iterative, for the same reason cycle detection
+  is. This is what `skip_downstream` marks.
 - `WorkflowBuilder` → the typed builder. Ergonomic, not lenient: it adds each input's
   source node to that node's `depends_on` and then runs the same `validate`.
 - **An input may only read from an ancestor.** Reading the output of a node you don't
@@ -89,6 +92,12 @@ No async, no I/O — trivially unit- and property-testable, and enforced by
   `NullModelClient` (refuses loudly, so a run with no provider fails with a sentence
   rather than an `AttributeError`) and `StubModelClient` (scripted, for tests). Provider
   -agnostic and HTTP-free: a concrete provider lives in `agents/`.
+- `metering.py` — `BudgetedModelClient`, which asks the run's `Budget` for permission
+  before a call and charges it afterwards. Lives here rather than in `policy/` because it
+  is the one piece of the budget story that has to know what a model call *is*; `Budget`
+  itself holds numbers only, which is what keeps `policy` free of any dependency on the
+  model seam. The executor stacks it *outside* the recorder, so a refused call is never
+  recorded — there is no response, and a replay must not find a call that never happened.
 - `recording.py` — `RecordingModelClient`, which wraps any client and writes every
   request/response into the run record keyed by `(run_id, node_id, attempt, sequence)`.
   That key is what a replay client will look calls up by. The wrapper is per-node and
@@ -106,11 +115,38 @@ No async, no I/O — trivially unit- and property-testable, and enforced by
   minted here, so no run depends on an id it cannot reproduce.
 
 ### Policy (`dagent/policy`)
+Computes; never acts. This package decides *how long* to wait, *whether* a failure earns
+another attempt, *who* may run, and *how much* may be spent — and the executor does the
+waiting, dispatching, and calling. Its only dependencies are `dagent.errors` and
+`dagent.models`, which is not a style preference: `dagent/runtime/__init__.py` imports the
+executor, so a policy module importing anything under `dagent.runtime` would make the whole
+package unimportable. `tests/test_isolation.py` enforces that arrow, and every other one
+between the layers, by AST.
+
 - `retry.py` — attempts, exponential backoff with full jitter, retryable-error
-  classification.
+  classification. The jitter is an injected function (`full_jitter` in production,
+  `no_jitter` in tests) rather than a call to `random`, for the same reason the clock is
+  injected: a run has to be able to reproduce its own delays. **Full** jitter rather than a
+  fixed exponential delay because identical backoff makes every node that failed against a
+  rate-limited provider retry at the same instant, re-creating the overload.
 - `limits.py` — a global `asyncio.Semaphore` and a dict of per-provider semaphores; a
   node acquires both before running (ordered acquisition to avoid permit deadlock).
-  `Budget` tracks tokens/cost and refuses admission past the ceiling.
+  Permits are taken **per attempt**, not per node: holding a slot through a backoff sleep
+  blocks a node that could be running. `Budget` tracks tokens/cost and refuses admission
+  past the ceiling. It distinguishes *exceeded* (a ceiling has been reached) from
+  *refused* (it actually stopped something), because a ceiling crossed by the last call of
+  an otherwise complete run stopped nothing, and reporting that run as `BUDGET_EXCEEDED`
+  would turn a success into a failure.
+- `run.py` — `FailureMode` (`run_to_completion` / `fail_fast` / `skip_downstream`) and
+  `RunPolicy`, the bundle the executor is handed. Node-level policy belongs to the frozen
+  *definition*; run-level policy belongs to this *execution* and is supplied at submit
+  time. Every default is inert — no cap, no ceiling, one attempt, no timeout — so a run
+  that passes no policy behaves exactly as it did before the policy layer existed.
+
+**No price table ships here.** Per-token prices are vendor knowledge that changes without
+warning, and a stale table baked into an execution engine reports confident, wrong numbers.
+The token ceiling is exact and needs no table; a run wanting a dollar ceiling injects the
+pricing it trusts (`runtime/metering.py`'s `Pricer`).
 
 ### Store (`dagent/store`)
 `StateStore` `Protocol`: `save_node_state`, `load_run`, `append_output`, `load_output`,
@@ -180,13 +216,29 @@ Loop:
 
 Step 4 is deliberately "no more progress is possible", not "no node is still `PENDING`".
 A node whose dependency failed never becomes ready, so it stays `PENDING` forever and a
-loop waiting for `PENDING` to empty would never exit. Phase 2 leaves such a node
-`PENDING` and ends the run `FAILED`; Phase 4's failure semantics decide whether it is
-instead marked `SKIPPED`, which is one of the three configurable modes and not something
-the scheduler should be choosing on its own.
+loop waiting for `PENDING` to empty would never exit.
+
+What happens to that node is a *policy* decision, not a scheduler one, so it is one of
+three configurable failure modes:
+
+| Mode | In-flight siblings | Blocked dependents | Further dispatch |
+|---|---|---|---|
+| `run_to_completion` (default) | finish | left `PENDING` | continues |
+| `skip_downstream` | finish | marked `SKIPPED` | continues |
+| `fail_fast` | cancelled, recorded `FAILED` | left `PENDING` | stops |
+
+`SKIPPED` and cancelled-`FAILED` are kept distinct on purpose: `SKIPPED` means *never
+dispatched, and never can be*, while a node cancelled by `fail_fast` did start and did not
+finish. Conflating them would lose the difference between "we chose not to" and "we
+stopped it".
 
 Fan-out is step 2 dispatching multiple ready nodes at once; fan-in is step 1
 re-detecting a node whose several deps just completed.
+
+**One subtlety worth stating:** `asyncio.wait` returns a *set*, and several nodes can land
+in one batch. Folding them in set order would make the record depend on hash iteration —
+two identical runs could attribute the same skipped node to different upstream failures.
+Completions are therefore folded in declaration order, the same tiebreak `ready_set` uses.
 
 ## 4. The hard problems (this is the senior signal)
 
@@ -273,3 +325,26 @@ acquisition.** Reflects the real constraint (providers rate-limit independently)
 prevents one provider's slowness from starving others past the global cap. Fixed
 acquisition order avoids permit deadlock. *Rejected:* a single global cap (ignores
 per-provider limits) or per-provider only (can blow past total resource budget).
+
+**DR-7: Errors are classified retryable at the point they are raised.**
+FR-5 says only retryable errors are retried, and the code best placed to judge is the code
+that failed: a provider client knows a 429 is weather and a 400 is a bug in the request.
+So `AgentError` carries a `retryable` flag, defaulting to `True` because most agent
+failures are transient provider trouble, and the classifier the policy layer applies is
+itself injectable. The default rule is deliberately narrow — an `AgentError` that has not
+marked itself permanent, or a `TimeoutError`. A `ValidationError` is as true next time; a
+`StoreError` means the thing recording the attempt is broken; a `TypeError` is a bug, and
+retrying it buys three identical stack traces and three times the latency. *Rejected:*
+retrying every exception (turns bugs into slow bugs), or a central table of retryable
+types (puts vendor knowledge in the core and goes stale silently).
+
+**DR-8: Timeouts are measured by the event loop, not by the injected `Clock`.**
+Every other read of time in dagent goes through the `Clock` seam, including retry backoff
+— which is why a test can assert a run waited four seconds without waiting. Timeouts are
+the deliberate exception: cancelling a coroutine at a deadline is something only the loop's
+own scheduler can do, and a wall-clock seam cannot make an `await` return. Backoff and
+timeout therefore sit on different clocks by design: backoff is a *duration the engine
+chooses* and must replay identically, while a timeout is a *deadline imposed on work whose
+duration the engine does not control*. Also why the timeout starts *inside* the concurrency
+permits rather than outside them — queueing for a slot is contention, not the node's own
+latency, and a node that never got to run has not overrun anything.

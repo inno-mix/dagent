@@ -46,7 +46,25 @@ class PolicyError(DagentError):
 
 
 class AgentError(DagentError):
-    """An agent raised while executing a node."""
+    """An agent raised while executing a node.
+
+    Carries a ``retryable`` hint because FR-5 retries only errors *classified* retryable,
+    and the code best placed to classify a failure is the code that raised it: a provider
+    client knows a 429 is weather and a 400 is a bug in the request. The default is
+    ``True`` — most agent failures are transient provider trouble — so a permanent failure
+    says so explicitly, and a caller who disagrees with the whole scheme passes its own
+    classifier to the policy layer.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        """Record the failure and whether another attempt could plausibly succeed.
+
+        Args:
+            message: Human-readable explanation, already naming the node or provider.
+            retryable: ``False`` when the same call would fail the same way again.
+        """
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class StoreError(DagentError):

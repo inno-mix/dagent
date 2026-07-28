@@ -5,9 +5,9 @@ completion, fold the result in, repeat. Fan-out is dispatching several ready nod
 once; fan-in is the recomputation afterwards noticing that a node's last dependency just
 landed. Nothing here knows what an agent does, and nothing here imports a model SDK.
 
-Phase 2 scope: a static graph, no retries, no timeouts, no concurrency caps. Those are
-the policy layer's job (Phase 4) and slot in around ``_execute`` without touching the
-loop.
+Policy wraps that loop rather than complicating it. A node's attempts, its timeout, the
+permits it holds and the budget it spends are all decided in ``dagent.policy`` and merely
+*applied* here, which is why adding retries did not change the loop by a line.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import asyncio
 from collections.abc import Mapping
 from datetime import datetime
 
-from dagent.graph.topo import nodes_by_id, ready_set
+from dagent.graph.topo import descendants, nodes_by_id, ready_set
 from dagent.graph.validate import validate
 from dagent.models.state import (
     NodeOutput,
@@ -25,9 +25,11 @@ from dagent.models.state import (
     RunState,
     RunStateRecord,
 )
-from dagent.models.workflow import Node, Workflow
+from dagent.models.workflow import Node, Policy, Workflow
+from dagent.policy.run import FailureMode, RunPolicy
 from dagent.runtime.agent import AgentContext
 from dagent.runtime.clock import Clock, SystemClock
+from dagent.runtime.metering import BudgetedModelClient
 from dagent.runtime.model import ModelClient, NullModelClient
 from dagent.runtime.recording import RecordingModelClient
 from dagent.runtime.registry import AgentRegistry
@@ -35,16 +37,14 @@ from dagent.store.base import StateStore
 
 __all__ = ["Executor"]
 
-_FIRST_ATTEMPT = 0
-"""Phase 2 runs every node exactly once. Phase 4's retries are what make this vary."""
-
 
 class Executor:
     """Runs a validated workflow to completion on a single event loop.
 
     Everything the executor depends on is injected: the agents come from a registry, the
-    durability from a ``StateStore`` protocol, and time from a ``Clock``. That is what
-    keeps this class testable with no network, no database, and no waiting.
+    durability from a ``StateStore`` protocol, time from a ``Clock``, and every limit from
+    a ``RunPolicy``. That is what keeps this class testable with no network, no database,
+    and no waiting.
     """
 
     def __init__(
@@ -54,17 +54,24 @@ class Executor:
         store: StateStore,
         clock: Clock | None = None,
         model: ModelClient | None = None,
+        policy: RunPolicy | None = None,
     ) -> None:
-        """Wire the executor to its agents, storage, source of time, and model provider.
+        """Wire the executor to its agents, storage, source of time, provider, and limits.
 
         One ``model`` client is shared by the whole run (AGENTS.md §4: never a client per
-        call). Each node gets a thin recording wrapper around it, not a connection of its
-        own. Omit it and agents that try to call a model fail with a clear message.
+        call). Each node gets thin recording and metering wrappers around it, not a
+        connection of its own. Omit it and agents that try to call a model fail with a
+        clear message.
+
+        Omitting ``policy`` gives a run with no caps, no ceiling, one attempt per node and
+        no timeout — the behaviour of an executor with no policy layer at all, so a limit
+        is always something a caller asked for.
         """
         self._registry = registry
         self._store = store
         self._clock: Clock = clock if clock is not None else SystemClock()
         self._model: ModelClient = model if model is not None else NullModelClient()
+        self._policy = policy if policy is not None else RunPolicy()
 
     async def run(self, workflow: Workflow, *, run_id: str) -> RunStateRecord:
         """Execute every node in the workflow and return the final run state.
@@ -82,6 +89,8 @@ class Executor:
         Raises:
             ValidationError: If the workflow is invalid or names an unregistered agent.
                 Nothing executes and nothing is written in that case.
+            CancelledError: If the caller cancels the run. Every node in flight is stopped
+                first and the run is checkpointed ``CANCELLED`` before this propagates.
         """
         # Submit-time validation, with the registry injected — this is the caller that
         # actually has one, which is why graph/ takes it as a parameter.
@@ -89,21 +98,26 @@ class Executor:
 
         nodes = nodes_by_id(workflow)
         states: dict[str, NodeState] = dict.fromkeys(nodes, NodeState.PENDING)
+        # Declaration order, so a batch of completions is folded in the same sequence
+        # every time — see the comment on `declared` below.
+        declared = {node_id: index for index, node_id in enumerate(nodes)}
         await self._open_run(run_id, workflow, states)
 
         in_flight: dict[asyncio.Task[NodeState], str] = {}
+        halted = False
         try:
             while True:
-                for node_id in ready_set(workflow, states):
-                    # Mark READY before dispatching: ready_set only offers PENDING nodes,
-                    # so this is what stops the next pass re-dispatching the same node.
-                    states[node_id] = NodeState.READY
-                    await self._record(run_id, node_id, NodeState.READY)
-                    task = asyncio.create_task(
-                        self._execute(run_id, nodes[node_id]),
-                        name=f"dagent:{run_id}:{node_id}",
-                    )
-                    in_flight[task] = node_id
+                if not halted:
+                    for node_id in ready_set(workflow, states):
+                        # Mark READY before dispatching: ready_set only offers PENDING
+                        # nodes, so this is what stops the next pass re-dispatching one.
+                        states[node_id] = NodeState.READY
+                        await self._record(run_id, node_id, NodeState.READY)
+                        task = asyncio.create_task(
+                            self._execute(run_id, nodes[node_id]),
+                            name=f"dagent:{run_id}:{node_id}",
+                        )
+                        in_flight[task] = node_id
 
                 # Nothing running and nothing ready: the graph can make no more progress.
                 # With a failed node that leaves its dependents PENDING — see _close_run.
@@ -111,67 +125,129 @@ class Executor:
                     break
 
                 done, _ = await asyncio.wait(set(in_flight), return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    states[in_flight.pop(task)] = task.result()
+                # `asyncio.wait` hands back a *set*, and several nodes can land in the
+                # same batch. Folding them in set order would make the record depend on
+                # hash iteration — two identical runs could then attribute a skipped node
+                # to different upstream failures. Declaration order restores rule 4.
+                failures: list[str] = []
+                for task in sorted(done, key=lambda finished: declared[in_flight[finished]]):
+                    node_id = in_flight.pop(task)
+                    states[node_id] = task.result()
+                    if states[node_id] is NodeState.FAILED:
+                        failures.append(node_id)
+
+                for node_id in failures:
+                    halted |= await self._apply_failure_mode(
+                        run_id, workflow, node_id, states, in_flight
+                    )
+        except asyncio.CancelledError:
+            # The caller walked away: stop every node, then say so in the record rather
+            # than leaving a run that looks like it is still going.
+            await self._cancel(in_flight)
+            await self._checkpoint(run_id, RunState.CANCELLED)
+            raise
         except BaseException:
-            # Includes CancelledError: if the caller walks away, no node keeps running.
             await self._cancel(in_flight)
             raise
 
-        return await self._close_run(run_id, states)
+        return await self._checkpoint(run_id, self._derive_run_state(states))
+
+    # --- one node -------------------------------------------------------------------
 
     async def _execute(self, run_id: str, node: Node) -> NodeState:
-        """Run one node under its own task and persist the outcome."""
-        started = self._clock.now()
-        await self._record(run_id, node.id, NodeState.RUNNING, started_at=started)
+        """Run one node under its own task, retrying as its policy allows.
 
-        try:
-            agent = self._registry.create(node.agent)
-            inputs = await self._resolve_inputs(run_id, node)
-            output = await agent.run(
-                AgentContext(
-                    run_id=run_id,
-                    node_id=node.id,
-                    attempt=_FIRST_ATTEMPT,
-                    inputs=inputs,
-                    params=node.params,
-                    clock=self._clock,
-                    # Per-node wrapper, shared underlying client: every model call this
-                    # node makes lands in the run record for replay (FR-8).
-                    model=RecordingModelClient(
-                        self._model,
-                        store=self._store,
-                        run_id=run_id,
-                        node_id=node.id,
-                        attempt=_FIRST_ATTEMPT,
-                        clock=self._clock,
-                    ),
-                )
+        Returns:
+            ``SUCCESS`` once an attempt produced an output, or ``FAILED`` when the
+            attempts ran out or the failure was not worth repeating.
+        """
+        policy = self._policy.policy_for(node.policy)
+        started = self._clock.now()
+        attempt = 0
+
+        while True:
+            await self._record(
+                run_id, node.id, NodeState.RUNNING, attempt=attempt, started_at=started
             )
-        except Exception as exc:
-            # A failing agent is an ordinary outcome, recorded and folded back into the
-            # loop. CancelledError is not an Exception, so cancellation still propagates.
+            try:
+                output = await self._attempt(run_id, node, attempt=attempt, policy=policy)
+            except Exception as exc:
+                # A failing agent is an ordinary outcome, recorded and folded back into
+                # the loop. CancelledError is not an Exception, so a cancelled node — and
+                # therefore a timed-out one, once its timeout has converted it — still
+                # propagates rather than being mistaken for a failure to retry.
+                if attempt + 1 >= policy.max_attempts or not self._policy.retryable(exc):
+                    await self._record(
+                        run_id,
+                        node.id,
+                        NodeState.FAILED,
+                        attempt=attempt,
+                        started_at=started,
+                        finished_at=self._clock.now(),
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    return NodeState.FAILED
+
+                # Deliberately no FAILED write between attempts. FAILED is terminal, and a
+                # terminal state a node then leaves is a lie — Phase 5's resume reads these
+                # records to decide what still needs doing. The rising `attempt` on the
+                # RUNNING record is the visible evidence that a retry happened.
+                await self._clock.sleep(self._policy.backoff.delay(policy, attempt))
+                attempt += 1
+                continue
+
+            # Output first, then SUCCESS: a node found SUCCESS must always have an output
+            # to read, or Phase 5's resume would skip a node whose result it cannot
+            # recover.
+            await self._store.append_output(run_id, node.id, output)
             await self._record(
                 run_id,
                 node.id,
-                NodeState.FAILED,
+                NodeState.SUCCESS,
+                attempt=attempt,
                 started_at=started,
                 finished_at=self._clock.now(),
-                error=f"{type(exc).__name__}: {exc}",
             )
-            return NodeState.FAILED
+            return NodeState.SUCCESS
 
-        # Output first, then SUCCESS: a node found SUCCESS must always have an output to
-        # read, or Phase 5's resume would skip a node whose result it cannot recover.
-        await self._store.append_output(run_id, node.id, output)
-        await self._record(
-            run_id,
-            node.id,
-            NodeState.SUCCESS,
-            started_at=started,
-            finished_at=self._clock.now(),
+    async def _attempt(
+        self, run_id: str, node: Node, *, attempt: int, policy: Policy
+    ) -> NodeOutput:
+        """Run the agent once, under this attempt's permits and timeout."""
+        agent = self._registry.create(node.agent)
+        inputs = await self._resolve_inputs(run_id, node)
+        context = AgentContext(
+            run_id=run_id,
+            node_id=node.id,
+            attempt=attempt,
+            inputs=inputs,
+            params=node.params,
+            clock=self._clock,
+            # Budget outermost, so a refused call is never recorded: there is no response
+            # to replay. Inside it, a per-node recorder over the run's shared client, so
+            # every call this attempt makes lands in the run record for replay (FR-8).
+            model=BudgetedModelClient(
+                RecordingModelClient(
+                    self._model,
+                    store=self._store,
+                    run_id=run_id,
+                    node_id=node.id,
+                    attempt=attempt,
+                    clock=self._clock,
+                ),
+                budget=self._policy.budget,
+            ),
         )
-        return NodeState.SUCCESS
+
+        # Permits are acquired per attempt, not per node: holding a slot through a backoff
+        # sleep would block a node that could be running. The timeout starts inside them,
+        # because queueing for a permit is contention rather than the node's own latency,
+        # and a node that never got to run has not overrun anything.
+        async with (
+            self._policy.limits.slot(self._model.provider),
+            asyncio.timeout(policy.timeout_s),
+        ):
+            return await agent.run(context)
 
     async def _resolve_inputs(self, run_id: str, node: Node) -> Mapping[str, NodeOutput]:
         """Read this node's declared inputs out of its upstream nodes' stored outputs.
@@ -184,6 +260,88 @@ class Executor:
             local_name: await self._store.load_output(run_id, source)
             for local_name, source in node.inputs.items()
         }
+
+    # --- failure semantics ------------------------------------------------------------
+
+    async def _apply_failure_mode(
+        self,
+        run_id: str,
+        workflow: Workflow,
+        failed: str,
+        states: dict[str, NodeState],
+        in_flight: dict[asyncio.Task[NodeState], str],
+    ) -> bool:
+        """React to one node's failure according to the run's failure mode (FR-5).
+
+        Returns:
+            Whether the loop should stop dispatching new nodes.
+        """
+        mode = self._policy.failure_mode
+        if mode is FailureMode.RUN_TO_COMPLETION:
+            return False
+
+        if mode is FailureMode.SKIP_DOWNSTREAM:
+            # Sorted so the record is written in the same order on every run, which is
+            # what keeps two runs of the same failure byte-comparable.
+            for node_id in sorted(descendants(workflow, failed)):
+                if states.get(node_id) is not NodeState.PENDING:
+                    continue
+                states[node_id] = NodeState.SKIPPED
+                await self._record(
+                    run_id,
+                    node_id,
+                    NodeState.SKIPPED,
+                    finished_at=self._clock.now(),
+                    error=f"skipped: upstream node {failed!r} failed",
+                )
+            return False
+
+        await self._cancel_siblings(run_id, in_flight, states, cause=failed)
+        return True
+
+    async def _cancel_siblings(
+        self,
+        run_id: str,
+        in_flight: dict[asyncio.Task[NodeState], str],
+        states: dict[str, NodeState],
+        *,
+        cause: str,
+    ) -> None:
+        """Stop every node still running, because one of their siblings failed.
+
+        Safe to call with nothing in flight. Nothing has awaited between ``asyncio.wait``
+        returning and this point, so every task here was genuinely still running when it
+        was cancelled — but a task whose agent swallowed the cancellation and returned
+        anyway keeps its real outcome, because reporting a completed node as cancelled
+        would be exactly the kind of lie the store must not contain.
+        """
+        for task in in_flight:
+            task.cancel()
+        await asyncio.gather(*in_flight, return_exceptions=True)
+
+        for task, node_id in in_flight.items():
+            if not task.cancelled():
+                states[node_id] = task.result()
+                continue
+            states[node_id] = NodeState.FAILED
+            await self._record(
+                run_id,
+                node_id,
+                NodeState.FAILED,
+                finished_at=self._clock.now(),
+                error=f"cancelled: fail_fast after node {cause!r} failed",
+            )
+        in_flight.clear()
+
+    async def _cancel(self, in_flight: dict[asyncio.Task[NodeState], str]) -> None:
+        """Cancel every in-flight node and wait for it to actually stop."""
+        for task in in_flight:
+            task.cancel()
+        # gather() of nothing is a no-op, so this needs no empty check.
+        await asyncio.gather(*in_flight, return_exceptions=True)
+        in_flight.clear()
+
+    # --- persistence ------------------------------------------------------------------
 
     async def _open_run(
         self, run_id: str, workflow: Workflow, states: Mapping[str, NodeState]
@@ -204,23 +362,14 @@ class Executor:
             )
         )
 
-    async def _close_run(self, run_id: str, states: Mapping[str, NodeState]) -> RunStateRecord:
-        """Derive and persist the run's terminal state.
+    async def _checkpoint(self, run_id: str, state: RunState) -> RunStateRecord:
+        """Persist the run's state, preserving everything written since it opened.
 
         Reloads before writing: node states have been written since the run was opened,
         and checkpointing a stale snapshot would throw them away.
-
-        A node blocked by a failed dependency is left ``PENDING`` here. Marking it
-        ``SKIPPED`` is one of the three failure semantics Phase 4 makes configurable, and
-        picking one now would be inventing a policy this phase has no mandate for.
         """
         run = await self._store.load_run(run_id)
-        final = run.model_copy(
-            update={
-                "state": _derive_run_state(states),
-                "updated_at": self._clock.now(),
-            }
-        )
+        final = run.model_copy(update={"state": state, "updated_at": self._clock.now()})
         await self._store.checkpoint(final)
         return final
 
@@ -230,6 +379,7 @@ class Executor:
         node_id: str,
         state: NodeState,
         *,
+        attempt: int = 0,
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
         error: str | None = None,
@@ -240,28 +390,26 @@ class Executor:
                 run_id=run_id,
                 node_id=node_id,
                 state=state,
-                attempt=_FIRST_ATTEMPT,
+                attempt=attempt,
                 started_at=started_at,
                 finished_at=finished_at,
                 error=error,
             )
         )
 
-    async def _cancel(self, in_flight: dict[asyncio.Task[NodeState], str]) -> None:
-        """Cancel every in-flight node and wait for it to actually stop."""
-        for task in in_flight:
-            task.cancel()
-        # gather() of nothing is a no-op, so this needs no empty check.
-        await asyncio.gather(*in_flight, return_exceptions=True)
-        in_flight.clear()
+    def _derive_run_state(self, states: Mapping[str, NodeState]) -> RunState:
+        """Turn the final node states, and the budget, into the run's outcome.
 
+        The budget comes first: if it refused work, that is *why* the run ended the way it
+        did, and ``FAILED`` would report the symptom instead of the cause. A ceiling merely
+        crossed by the last call of an otherwise complete run is not a refusal and does not
+        change a success into a failure — see :attr:`~dagent.policy.limits.Budget.refused`.
 
-def _derive_run_state(states: Mapping[str, NodeState]) -> RunState:
-    """A run succeeded only if every one of its nodes did.
-
-    Phase 4 adds the other two terminal states: ``BUDGET_EXCEEDED`` when admission is
-    refused, and ``CANCELLED`` when the run is stopped from outside.
-    """
-    if all(state == NodeState.SUCCESS for state in states.values()):
-        return RunState.SUCCEEDED
-    return RunState.FAILED
+        A node blocked by a failed dependency is left ``PENDING`` unless the failure mode
+        said otherwise, so it counts as "not SUCCESS" and the run is ``FAILED``.
+        """
+        if self._policy.budget.refused:
+            return RunState.BUDGET_EXCEEDED
+        if all(state is NodeState.SUCCESS for state in states.values()):
+            return RunState.SUCCEEDED
+        return RunState.FAILED

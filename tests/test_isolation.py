@@ -201,3 +201,47 @@ def test_no_orchestration_framework_is_declared_as_a_dependency() -> None:
         assert _banned_match(name, ORCHESTRATION_FRAMEWORKS) is None, (
             f"{requirement!r} is an orchestration framework"
         )
+
+
+# The dependency arrows the architecture actually rests on. A package may import itself,
+# anything below it, and nothing above it. `agents/` is absent on purpose: it sits at the
+# top and may depend on all of them, which is the whole point of rule 3.
+ALLOWED_DEPENDENCIES = {
+    "models": frozenset({"errors", "models"}),
+    "graph": frozenset({"errors", "models", "graph"}),
+    "policy": frozenset({"errors", "models", "policy"}),
+    "store": frozenset({"errors", "models", "store"}),
+    "runtime": frozenset({"errors", "models", "graph", "policy", "store", "runtime"}),
+}
+
+LAYERED_FILES = [
+    path
+    for path in ALL_FILES
+    if path.relative_to(PACKAGE_ROOT).parts[0].removesuffix(".py") in ALLOWED_DEPENDENCIES
+]
+
+
+@pytest.mark.parametrize("path", LAYERED_FILES, ids=_ids(LAYERED_FILES))
+def test_module_imports_nothing_from_a_layer_above_it(path: pathlib.Path) -> None:
+    # Not style: `dagent/runtime/__init__.py` imports the executor, so a policy module
+    # importing anything under `dagent.runtime` makes the whole package unimportable.
+    # This says so at the boundary instead of at the circular-import traceback.
+    layer = path.relative_to(PACKAGE_ROOT).parts[0].removesuffix(".py")
+    allowed = ALLOWED_DEPENDENCIES[layer]
+
+    offenders = sorted(
+        module
+        for module in _imported_modules(path)
+        if module.startswith("dagent.") and module.split(".")[1].removesuffix(".py") not in allowed
+    )
+
+    assert not offenders, (
+        f"{path.relative_to(REPO_ROOT)} is in the {layer!r} layer and imports {offenders}, "
+        f"which sits above it. {layer!r} may import: {sorted(allowed)}."
+    )
+
+
+def test_the_layering_scan_actually_covers_files() -> None:
+    assert LAYERED_FILES
+    covered = {path.relative_to(PACKAGE_ROOT).parts[0] for path in LAYERED_FILES}
+    assert covered == set(ALLOWED_DEPENDENCIES)

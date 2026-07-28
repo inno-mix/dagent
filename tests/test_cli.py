@@ -144,3 +144,58 @@ def test_run_closes_the_model_client_even_when_the_run_fails(
 
     assert result.exit_code == 0
     assert closed == [True]
+
+
+# --- Phase 4: run-level policy from the command line ---------------------------------
+
+
+def test_run_accepts_a_concurrency_cap() -> None:
+    result = runner.invoke(app, ["run", EXAMPLE, "--provider", "stub", "--max-concurrency", "1"])
+
+    assert result.exit_code == 0
+    assert "succeeded" in result.output
+
+
+def test_run_accepts_a_per_provider_cap() -> None:
+    result = runner.invoke(
+        app, ["run", EXAMPLE, "--provider", "stub", "--provider-concurrency", "1"]
+    )
+
+    assert result.exit_code == 0
+
+
+def test_a_token_ceiling_ends_the_run_in_budget_exceeded() -> None:
+    result = runner.invoke(app, ["run", EXAMPLE, "--provider", "stub", "--max-tokens", "1"])
+
+    assert result.exit_code == 1
+    assert "budget_exceeded" in result.output
+    assert "model call(s) refused" in result.output
+
+
+def test_a_generous_token_ceiling_leaves_the_run_alone() -> None:
+    result = runner.invoke(app, ["run", EXAMPLE, "--provider", "stub", "--max-tokens", "1000000"])
+
+    assert result.exit_code == 0
+    assert "refused" not in result.output
+
+
+def test_run_accepts_each_failure_mode() -> None:
+    for mode in ("run_to_completion", "fail_fast", "skip_downstream"):
+        result = runner.invoke(app, ["run", EXAMPLE, "--provider", "stub", "--on-failure", mode])
+
+        assert result.exit_code == 0, mode
+
+
+def test_run_rejects_an_unknown_failure_mode() -> None:
+    result = runner.invoke(app, ["run", EXAMPLE, "--provider", "stub", "--on-failure", "panic"])
+
+    assert result.exit_code == 2
+    assert "unknown failure mode" in result.output
+
+
+def test_run_rejects_a_concurrency_cap_of_zero() -> None:
+    # Fail loud at submit time rather than starting a run that can never dispatch.
+    result = runner.invoke(app, ["run", EXAMPLE, "--provider", "stub", "--max-concurrency", "0"])
+
+    assert result.exit_code == 2
+    assert "at least 1" in result.output

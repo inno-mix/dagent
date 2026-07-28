@@ -58,7 +58,10 @@ def _single_input(ctx: AgentContext, agent_name: str) -> str:
     """Return the node's one input as text, or explain why that was not possible."""
     if len(ctx.inputs) != 1:
         raise AgentError(
-            f"{agent_name} node {ctx.node_id!r} expects exactly one input, got {sorted(ctx.inputs)}"
+            f"{agent_name} node {ctx.node_id!r} expects exactly one input, "
+            f"got {sorted(ctx.inputs)}",
+            # A wiring mistake in the definition, identical on every attempt.
+            retryable=False,
         )
     (value,) = ctx.inputs.values()
     return value if isinstance(value, str) else str(value)

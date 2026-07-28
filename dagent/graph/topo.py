@@ -15,7 +15,13 @@ from dagent.errors import ValidationError
 from dagent.models.state import NodeState
 from dagent.models.workflow import Node, Workflow
 
-__all__ = ["node_dependencies", "nodes_by_id", "ready_set", "topological_order"]
+__all__ = [
+    "descendants",
+    "node_dependencies",
+    "nodes_by_id",
+    "ready_set",
+    "topological_order",
+]
 
 
 def node_dependencies(node: Node) -> frozenset[str]:
@@ -84,6 +90,35 @@ def topological_order(workflow: Workflow) -> tuple[str, ...]:
             f"workflow {workflow.name!r} contains a cycle among: {', '.join(stuck)}"
         )
     return tuple(order)
+
+
+def descendants(workflow: Workflow, node_id: str) -> frozenset[str]:
+    """Return every node that depends on ``node_id``, directly or transitively.
+
+    This is the blast radius of a failure: once ``node_id`` fails, no node in this set can
+    ever satisfy :func:`ready_set`, so the ``skip_downstream`` failure mode uses it to say
+    so out loud rather than leaving those nodes ``PENDING`` forever.
+
+    Iterative rather than recursive, for the same reason cycle detection is: a deep chain
+    must not depend on the interpreter's stack limit. Tolerates a ``node_id`` that is not
+    in the workflow by returning an empty set — a caller asking about a node that has just
+    been removed wants an empty blast radius, not an exception.
+    """
+    dependents: dict[str, list[str]] = {node.id: [] for node in workflow.nodes}
+    for node in workflow.nodes:
+        for dependency in node_dependencies(node):
+            if dependency in dependents:
+                dependents[dependency].append(node.id)
+
+    reached: set[str] = set()
+    queue = deque(dependents.get(node_id, ()))
+    while queue:
+        current = queue.popleft()
+        if current in reached:
+            continue
+        reached.add(current)
+        queue.extend(dependents[current])
+    return frozenset(reached)
 
 
 def ready_set(workflow: Workflow, states: Mapping[str, NodeState]) -> tuple[str, ...]:
