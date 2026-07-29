@@ -13,7 +13,9 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from dagent.models.state import NodeOutput
+from dagent.models.workflow import Node
 from dagent.runtime.clock import Clock
+from dagent.runtime.expansion import Expansion
 from dagent.runtime.model import ModelClient, NullModelClient
 
 __all__ = ["Agent", "AgentContext"]
@@ -27,8 +29,8 @@ class AgentContext:
     objects like the clock, which are behaviour rather than data and have no business
     being validated or serialized.
 
-    Later phases widen this rather than reshape it — the budget handle lands in Phase 4
-    as a further injected seam.
+    Later phases widen this rather than reshape it: Phase 4 added the model seam's
+    metering, Phase 5 the idempotency key, Phase 6 the expansion handle.
     """
 
     run_id: str
@@ -45,6 +47,26 @@ class AgentContext:
     gets a client that refuses loudly, which turns "forgot to configure a provider" into
     a clear error rather than a crash inside agent code.
     """
+
+    expansion: Expansion = field(default_factory=Expansion)
+    """Where a request to grow the graph is collected. Use :meth:`expand` rather than this."""
+
+    def expand(self, *nodes: Node) -> None:
+        """Ask the executor to add these nodes to the running graph (FR-7).
+
+        Nothing happens immediately. The request is collected, and applied only once this
+        node succeeds — so an attempt that expands and *then* fails leaves no trace, and
+        the retry that follows starts from a graph nobody has already grown.
+
+        The executor validates the augmented graph before merging it. An expansion that
+        would introduce a cycle, name an unregistered agent, redefine an existing node, or
+        run past the depth limit fails *this node* and leaves the rest of the run alone.
+
+        Build the nodes with :func:`~dagent.graph.builder.build_node`, which fills in the
+        ``depends_on`` edges implied by their inputs — the same thing ``WorkflowBuilder``
+        does, so a generated node is held to exactly the standard a written one is.
+        """
+        self.expansion.add(*nodes)
 
     @property
     def idempotency_key(self) -> str:

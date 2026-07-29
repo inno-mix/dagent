@@ -72,6 +72,13 @@ Pure functions over a `Workflow`.
 - `descendants(workflow, node_id)` → the blast radius of a failure: every node that can
   never become ready once `node_id` fails. Iterative, for the same reason cycle detection
   is. This is what `skip_downstream` marks.
+- `expand_workflow(workflow, added, *, known_agents)` → the augmented workflow, or a
+  rejection. **Append-only**, and that is the guardrail rather than an implementation
+  detail — see §4. Restating an existing node *identically* is a no-op, which is what lets
+  a planner be re-executed after a crash.
+- `build_node(...)` → one node with the `depends_on` edges its inputs imply. Shared with
+  `WorkflowBuilder`, so a planner-generated node is held to the standard a hand-written one
+  is, rather than to a second one that drifts.
 - `WorkflowBuilder` → the typed builder. Ergonomic, not lenient: it adds each input's
   source node to that node's `depends_on` and then runs the same `validate`.
 - **An input may only read from an ancestor.** Reading the output of a node you don't
@@ -111,6 +118,14 @@ No async, no I/O — trivially unit- and property-testable, and enforced by
   injection; the module-level `default_registry` is a convenience nothing in the engine
   depends on. Re-registering a name raises rather than silently replacing — otherwise a
   workflow's behaviour would depend on import order.
+- `expansion.py` — `Expansion`, the request an agent fills in via `ctx.expand(...)`, and
+  `RunGraph`, the live definition for one run. `RunGraph.apply` **contains no `await`**,
+  and that is load-bearing: on a single event loop the absence of a suspension point is
+  what makes validate-and-merge atomic, so two planners finishing in the same batch are
+  applied one after the other and the second is checked against a graph that already
+  includes the first. No lock, no queue, and no window in which the graph is half-expanded.
+  `tests/runtime/test_run_graph.py` asserts the absence of `await` by AST, because a stray
+  one would reintroduce that window silently.
 - `executor.py` — the scheduler. Owns the run loop, the ready-set recomputation, the
   concurrency permits, the handoff to the policy layer, and `resume`. A fresh run and a
   resumed one share one loop: `run` seeds it with every node `PENDING`, `resume` seeds it
@@ -293,13 +308,34 @@ The design principle: **make re-execution safe first, then make resume trivial.*
 deliberately the Temporal problem in miniature, and the README should say so.
 
 ### Dynamic DAG expansion
-A planner returns new node definitions. The executor: (1) revalidates the *augmented*
-graph (must stay acyclic), (2) inserts nodes as `PENDING`, (3) lets the normal
-ready-set loop pick them up. The invariant that prevents deadlock: expansion only ever
-*adds* nodes and edges among new/incomplete nodes — it never adds a dependency onto an
-already-`SUCCESS` node in a way that could strand a running branch. Expansion is
-serialized through the executor's single loop, so there's no concurrent mutation of the
-graph.
+An agent calls `ctx.expand(...)` with nodes built by `build_node`. The request is collected
+on its context and applied **only once that attempt succeeds** — an attempt that expands and
+then fails leaves nothing behind, so the retry starts from a graph nobody has already
+grown. The executor then: (1) revalidates the *augmented* graph, (2) persists it, (3)
+records the new nodes as `PENDING`, and (4) lets the normal ready-set loop pick them up. A
+node absent from the state map counts as `PENDING`, which Phase 1 chose for exactly this
+moment: expansion needs no state backfill and no second scheduling path.
+
+**The invariant that prevents deadlock is that expansion is append-only.** Existing nodes
+are carried over untouched and can never gain a dependency, because a node already
+`RUNNING` or `SUCCESS` re-checks nothing and would be stranded by one. The *reverse* is
+always safe: a new node may depend on an existing node in any state, including one that has
+already finished — which is precisely how a planner's generated children depend on the
+planner that generated them, and how the showcase workflow works at all.
+
+That also decides where the fan-in lives. The synthesizer cannot be written into the file,
+because it has to depend on nodes that did not exist when the file was written; the planner
+emits it alongside the researchers it fans in.
+
+Two bounds, for two different failure modes. `max_expansion_depth` (default 1: a planner
+may plan, and what it plans may not plan further) stops an agent that emits a copy of
+itself. `max_graph_nodes` stops any runaway however it arose — and unlike depth, which is
+counted in memory and starts fresh on resume, it is measured against the persisted graph,
+so it is the bound that survives a crash.
+
+A rejected expansion fails *that node* and nothing else: `ValidationError` reaches the
+executor as an ordinary node failure, the default retry classification does not retry it,
+and the run carries on and terminates normally. A bad planner cannot deadlock a run.
 
 ### Backpressure & limits
 Model APIs are rate-limited and cost money, so concurrency is gated on two axes at
@@ -379,7 +415,18 @@ retrying it buys three identical stack traces and three times the latency. *Reje
 retrying every exception (turns bugs into slow bugs), or a central table of retryable
 types (puts vendor knowledge in the core and goes stale silently).
 
-**DR-8: The workflow definition is persisted with the run, and `resume` takes only a
+**DR-8: A planner is an ordinary agent that happens to return a graph-shaped opinion.**
+Expansion is requested through `ctx.expand(...)` on the context every agent already has,
+rather than through a second `Planner` protocol or a magic key in the returned output. One
+agent contract means the registry, the retry loop, the timeout, the budget, the recording
+wrapper and the idempotency key all apply to a planner unchanged — none of them had to
+learn what a planner is. It also means a planner can both expand *and* produce an ordinary
+output, which is how the showcase reports the plan it chose. *Rejected:* a separate
+protocol (two contracts to keep in step, and an awkward answer to "what is the node's
+output?"), and a sentinel key in the output (stringly-typed, and indistinguishable from an
+agent that happens to return that key).
+
+**DR-9: The workflow definition is persisted with the run, and `resume` takes only a
 run id.** The alternative — hand `resume` the file again — is what Airflow and Temporal do,
 and it is defensible: the definition is code, the state is data. It breaks the moment a
 planner grows the graph at run time (Phase 6, FR-7), because the augmented graph exists in
@@ -388,7 +435,7 @@ against an edited definition. *Rejected:* reconstructing from the file (unresuma
 expansion lands), and embedding the graph in `RunStateRecord` (rewritten on every
 checkpoint, and it would make `models/state.py` import `models/workflow.py` in a cycle).
 
-**DR-9: Timeouts are measured by the event loop, not by the injected `Clock`.**
+**DR-10: Timeouts are measured by the event loop, not by the injected `Clock`.**
 Every other read of time in dagent goes through the `Clock` seam, including retry backoff
 — which is why a test can assert a run waited four seconds without waiting. Timeouts are
 the deliberate exception: cancelling a coroutine at a deadline is something only the loop's

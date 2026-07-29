@@ -1,0 +1,29 @@
+# The showcase (SPEC §6): a graph whose shape is decided at run time.
+#
+#   uv run --env-file .env dagent run examples/research_dynamic.yaml
+#
+# Two nodes are written down. The planner decomposes the question into subtopics, then
+# grows the graph to answer it — one `researcher` per subtopic, running in parallel, and a
+# `synthesizer` that fans them back in. Neither the researchers nor the synthesizer appear
+# below, because how many of them there should be is not knowable until the model has read
+# the question.
+#
+# Compare `research.yaml`, which is the same workflow with the fan-out written by hand.
+name: research-dynamic
+
+nodes:
+  - id: question
+    agent: constant
+    params:
+      value: How do modern language models learn to follow instructions?
+
+  - id: plan
+    agent: planner
+    inputs:
+      question: question
+    params:
+      subtopics: 3
+    policy:
+      max_attempts: 3
+      backoff_initial_s: 1.0
+      timeout_s: 60

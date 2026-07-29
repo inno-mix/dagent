@@ -19,7 +19,7 @@ from dagent.graph.validate import validate
 from dagent.models.state import NodeOutput
 from dagent.models.workflow import Node, Policy, Workflow
 
-__all__ = ["WorkflowBuilder"]
+__all__ = ["WorkflowBuilder", "build_node"]
 
 
 class WorkflowBuilder:
@@ -62,23 +62,16 @@ class WorkflowBuilder:
             ValidationError: If the node itself is malformed. The graph-level rules are
                 checked later, by :meth:`build`.
         """
-        resolved_inputs = dict(inputs or {})
-        edges = list(depends_on)
-        edges.extend(source for source in resolved_inputs.values() if source not in edges)
-
-        try:
-            node = Node(
-                id=node_id,
-                agent=agent,
-                depends_on=tuple(edges),
-                inputs=resolved_inputs,
-                params=dict(params or {}),
+        self._nodes.append(
+            build_node(
+                node_id,
+                agent,
+                depends_on=depends_on,
+                inputs=inputs,
+                params=params,
                 policy=policy,
             )
-        except PydanticValidationError as exc:
-            raise ValidationError(f"invalid node {node_id!r}: {exc}") from exc
-
-        self._nodes.append(node)
+        )
         return self
 
     def build(self, *, known_agents: Collection[str] | None = None) -> Workflow:
@@ -103,3 +96,43 @@ class WorkflowBuilder:
 
         validate(workflow, known_agents=known_agents)
         return workflow
+
+
+def build_node(
+    node_id: str,
+    agent: str,
+    *,
+    depends_on: Sequence[str] = (),
+    inputs: Mapping[str, str] | None = None,
+    params: Mapping[str, NodeOutput] | None = None,
+    policy: Policy | None = None,
+) -> Node:
+    """Build one node, adding each input's source to ``depends_on``.
+
+    The same ergonomics as :meth:`WorkflowBuilder.add_node`, for callers that produce
+    nodes without producing a whole workflow — a Phase 6 planner emitting nodes into a
+    graph that is already running. Sharing the function is what stops the two paths from
+    drifting: a planner that had to remember to declare its own edges would eventually
+    forget, and the strict validator would reject its work at run time instead of at
+    review time.
+
+    Raises:
+        ValidationError: If the node is malformed. Graph-level rules are someone else's
+            job — :func:`dagent.graph.validate.validate` for a whole workflow, or
+            :meth:`~dagent.runtime.expansion.RunGraph.apply` for an expansion.
+    """
+    resolved_inputs = dict(inputs or {})
+    edges = list(depends_on)
+    edges.extend(source for source in resolved_inputs.values() if source not in edges)
+
+    try:
+        return Node(
+            id=node_id,
+            agent=agent,
+            depends_on=tuple(edges),
+            inputs=resolved_inputs,
+            params=dict(params or {}),
+            policy=policy,
+        )
+    except PydanticValidationError as exc:
+        raise ValidationError(f"invalid node {node_id!r}: {exc}") from exc

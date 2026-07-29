@@ -209,3 +209,56 @@ def test_the_shipped_research_example_loads_and_validates() -> None:
 
     assert workflow.name == "research"
     assert {node.agent for node in workflow.nodes} == {"constant", "researcher", "synthesizer"}
+
+
+# --- the shipped YAML examples --------------------------------------------------------
+
+YAML_EXAMPLES = sorted((pathlib.Path(__file__).parent.parent / "examples").glob("*.yaml"))
+
+
+def test_there_are_yaml_examples_to_check() -> None:
+    assert YAML_EXAMPLES
+
+
+@pytest.mark.parametrize("path", YAML_EXAMPLES, ids=lambda p: p.name)
+def test_every_shipped_example_loads_and_validates(path: pathlib.Path) -> None:
+    # An example that does not load is documentation that lies. The agent check runs too,
+    # so an example naming an agent nobody registered fails here rather than at a demo.
+    import dagent.agents  # noqa: F401  — registers the built-ins
+    from dagent.graph.validate import validate
+    from dagent.runtime.registry import default_registry
+
+    workflow = load_workflow_file(path)
+
+    validate(workflow, known_agents=default_registry.names())
+
+
+@pytest.mark.asyncio
+async def test_the_dynamic_example_grows_its_own_graph() -> None:
+    # Two nodes written down; more than two nodes after it runs. That difference is FR-7.
+    import dagent.agents  # noqa: F401
+    from dagent.runtime.executor import Executor
+    from dagent.runtime.model import StubModelClient
+    from dagent.runtime.registry import default_registry
+    from dagent.store.memory import InMemoryStateStore
+
+    path = pathlib.Path(__file__).parent.parent / "examples" / "research_dynamic.yaml"
+    workflow = load_workflow_file(path)
+    store = InMemoryStateStore()
+
+    run = await Executor(
+        registry=default_registry,
+        store=store,
+        model=StubModelClient(lambda request: "first topic\nsecond topic\nthird topic"),
+    ).run(workflow, run_id="dyn")
+
+    assert len(workflow.nodes) == 2
+    assert sorted(run.nodes) == [
+        "plan",
+        "plan.research_0",
+        "plan.research_1",
+        "plan.research_2",
+        "plan.synthesis",
+        "question",
+    ]
+    assert run.state.value == "succeeded"

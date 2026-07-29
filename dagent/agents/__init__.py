@@ -5,10 +5,10 @@ a boundary ``tests/test_isolation.py`` enforces mechanically. Everything upstrea
 only the ``Agent`` and ``ModelClient`` protocols.
 
 Importing this package registers its agents on ``dagent.runtime.default_registry`` under
-the names a workflow file uses: ``researcher``, ``synthesizer``, ``constant``, ``fake``,
-``echo``. The agents built to misbehave or to need injection — ``FailingAgent``,
-``FlakyAgent``, ``HangingAgent``, ``SideEffectAgent`` — are exported but deliberately
-unregistered, so no workflow can name one by accident.
+the names a workflow file uses: ``planner``, ``researcher``, ``synthesizer``,
+``constant``, ``fake``, ``echo``. The agents built to misbehave or to need injection —
+``FailingAgent``, ``FlakyAgent``, ``HangingAgent``, ``SideEffectAgent`` — are exported
+but deliberately unregistered, so no workflow can name one by accident.
 """
 
 from dagent.agents.fake import (
@@ -21,6 +21,7 @@ from dagent.agents.fake import (
     SideEffectAgent,
 )
 from dagent.agents.gemini import GeminiClient
+from dagent.agents.planner import PlannerAgent
 from dagent.agents.researcher import ResearcherAgent
 from dagent.agents.synthesizer import SynthesizerAgent
 
@@ -32,6 +33,7 @@ __all__ = [
     "FlakyAgent",
     "GeminiClient",
     "HangingAgent",
+    "PlannerAgent",
     "ResearcherAgent",
     "SideEffectAgent",
     "SynthesizerAgent",

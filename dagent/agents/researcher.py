@@ -21,9 +21,11 @@ SYSTEM = (
 class ResearcherAgent:
     """Turns a topic into findings.
 
-    Reads whichever input the node declares — the agent does not care what its upstream
-    node is called, only that exactly one input arrives. That is what lets the same agent
-    sit under a static edge today and under a planner-generated one in Phase 6.
+    Takes its topic from whichever input the node declares — the agent does not care what
+    its upstream node is called, only that exactly one input arrives — or from a ``topic``
+    parameter when it has no inputs at all. The second path is what a Phase 6 planner uses:
+    a generated researcher waits on its planner for *ordering*, but the subtopic it was
+    assigned is written into its definition, not passed along an edge.
     """
 
     def __init__(self, *, max_output_tokens: int = 700, temperature: float = 0.3) -> None:
@@ -35,9 +37,10 @@ class ResearcherAgent:
         """Research the incoming topic and return the findings.
 
         Raises:
-            AgentError: If the node was not given exactly one input to research.
+            AgentError: If the node was given neither a ``topic`` parameter nor exactly
+                one input to research.
         """
-        topic = _single_input(ctx, "researcher")
+        topic = _topic(ctx)
         response = await ctx.model.complete(
             ModelRequest(
                 prompt=f"Topic: {topic}\n\nWhat should a well-informed reader know?",
@@ -52,6 +55,18 @@ class ResearcherAgent:
             "provider": response.provider,
             "model": response.model,
         }
+
+
+def _topic(ctx: AgentContext) -> str:
+    """Return what this node was asked to research.
+
+    A ``topic`` parameter wins over an input, because a node that was handed its subject
+    in its own definition has no reason to go looking upstream for one.
+    """
+    topic = ctx.params.get("topic")
+    if isinstance(topic, str) and topic:
+        return topic
+    return _single_input(ctx, "researcher")
 
 
 def _single_input(ctx: AgentContext, agent_name: str) -> str:

@@ -30,6 +30,7 @@ from dagent.models.workflow import Node, Policy, Workflow
 from dagent.policy.run import FailureMode, RunPolicy
 from dagent.runtime.agent import AgentContext
 from dagent.runtime.clock import Clock, SystemClock
+from dagent.runtime.expansion import Expansion, RunGraph
 from dagent.runtime.metering import BudgetedModelClient
 from dagent.runtime.model import ModelClient, NullModelClient
 from dagent.runtime.recording import RecordingModelClient
@@ -109,7 +110,7 @@ class Executor:
 
         states: dict[str, NodeState] = dict.fromkeys(nodes_by_id(workflow), NodeState.PENDING)
         await self._open_run(run_id, workflow, states)
-        return await self._drive(run_id, workflow, states, attempts={})
+        return await self._drive(run_id, self._live_graph(workflow), states, attempts={})
 
     async def resume(self, run_id: str) -> RunStateRecord:
         """Continue a run that was interrupted, and return its final state.
@@ -159,12 +160,29 @@ class Executor:
 
         await self._rehydrate_budget(run_id)
         await self._checkpoint(run_id, RunState.RUNNING)
-        return await self._drive(run_id, workflow, states, attempts)
+        return await self._drive(run_id, self._live_graph(workflow), states, attempts)
+
+    def _live_graph(self, workflow: Workflow) -> RunGraph:
+        """Wrap a definition in the holder that lets it grow (FR-7).
+
+        A resumed run treats every node in the reloaded graph as generation zero, so the
+        depth limit bounds one run *attempt* rather than a run across many crashes. The
+        bound that survives a crash is ``max_graph_nodes``, which is measured against the
+        graph as persisted. Recording provenance per node would close the gap, at the cost
+        of putting an engine concept into the user-facing schema; the node ceiling buys
+        the same safety for nothing.
+        """
+        return RunGraph(
+            workflow,
+            known_agents=self._registry.names(),
+            max_depth=self._policy.max_expansion_depth,
+            max_nodes=self._policy.max_graph_nodes,
+        )
 
     async def _drive(
         self,
         run_id: str,
-        workflow: Workflow,
+        graph: RunGraph,
         states: dict[str, NodeState],
         attempts: Mapping[str, int],
     ) -> RunStateRecord:
@@ -173,16 +191,23 @@ class Executor:
         There is exactly one of these on purpose: a resume that went down a second code
         path would be a second set of scheduling bugs, and the whole claim of DR-4 is that
         resume is *not* special — it is the same loop over reloaded state.
-        """
-        nodes = nodes_by_id(workflow)
-        # Declaration order, so a batch of completions is folded in the same sequence
-        # every time — see the comment where `declared` is used below.
-        declared = {node_id: index for index, node_id in enumerate(nodes)}
 
+        The graph is re-read from ``graph`` on every pass rather than captured once,
+        because a node that expanded it since the last pass has already changed it. Nodes
+        that appeared this way are simply absent from ``states``, and ``ready_set`` counts
+        an absent node as ``PENDING`` — Phase 1 chose that rule for exactly this moment, so
+        expansion needs no state backfill and no second scheduling path.
+        """
         in_flight: dict[asyncio.Task[NodeState], str] = {}
         halted = False
         try:
             while True:
+                workflow = graph.workflow
+                nodes = nodes_by_id(workflow)
+                # Declaration order, so a batch of completions is folded in the same
+                # sequence every time — see the comment where `declared` is used below.
+                declared = {node_id: index for index, node_id in enumerate(nodes)}
+
                 if not halted:
                     for node_id in ready_set(workflow, states):
                         # Mark READY before dispatching: ready_set only offers PENDING
@@ -193,7 +218,10 @@ class Executor:
                         )
                         task = asyncio.create_task(
                             self._execute(
-                                run_id, nodes[node_id], first_attempt=attempts.get(node_id, 0)
+                                run_id,
+                                nodes[node_id],
+                                graph=graph,
+                                first_attempt=attempts.get(node_id, 0),
                             ),
                             name=f"dagent:{run_id}:{node_id}",
                         )
@@ -218,7 +246,7 @@ class Executor:
 
                 for node_id in failures:
                     halted |= await self._apply_failure_mode(
-                        run_id, workflow, node_id, states, in_flight
+                        run_id, graph.workflow, node_id, states, in_flight
                     )
         except asyncio.CancelledError:
             # The caller walked away: stop every node, then say so in the record rather
@@ -230,16 +258,19 @@ class Executor:
             await self._cancel(in_flight)
             raise
 
-        return await self._checkpoint(run_id, self._derive_run_state(states))
+        return await self._checkpoint(run_id, self._derive_run_state(graph.workflow, states))
 
     # --- one node -------------------------------------------------------------------
 
-    async def _execute(self, run_id: str, node: Node, *, first_attempt: int = 0) -> NodeState:
+    async def _execute(
+        self, run_id: str, node: Node, *, graph: RunGraph, first_attempt: int = 0
+    ) -> NodeState:
         """Run one node under its own task, retrying as its policy allows.
 
         Args:
             run_id: The run this node belongs to.
             node: The node to execute.
+            graph: The live graph, so a node that asks to expand it can be answered.
             first_attempt: Where to start counting. Non-zero only on resume, where an
                 interrupted node re-runs under the attempt — and therefore the
                 idempotency key — it was already using when the process died.
@@ -257,7 +288,9 @@ class Executor:
                 run_id, node.id, NodeState.RUNNING, attempt=attempt, started_at=started
             )
             try:
-                output = await self._attempt(run_id, node, attempt=attempt, policy=policy)
+                output = await self._attempt(
+                    run_id, node, attempt=attempt, policy=policy, graph=graph
+                )
             except Exception as exc:
                 # A failing agent is an ordinary outcome, recorded and folded back into
                 # the loop. CancelledError is not an Exception, so a cancelled node — and
@@ -285,7 +318,9 @@ class Executor:
 
             # Output first, then SUCCESS: a node found SUCCESS must always have an output
             # to read, or Phase 5's resume would skip a node whose result it cannot
-            # recover.
+            # recover. The expansion lands before both, so a graph that grew is durable
+            # before anything says the node that grew it is done — a crash in between
+            # re-runs the planner, whose replayed expansion is then a no-op.
             await self._store.append_output(run_id, node.id, output)
             await self._record(
                 run_id,
@@ -298,11 +333,19 @@ class Executor:
             return NodeState.SUCCESS
 
     async def _attempt(
-        self, run_id: str, node: Node, *, attempt: int, policy: Policy
+        self, run_id: str, node: Node, *, attempt: int, policy: Policy, graph: RunGraph
     ) -> NodeOutput:
-        """Run the agent once, under this attempt's permits and timeout."""
+        """Run the agent once, under this attempt's permits and timeout.
+
+        A node that asked to grow the graph has that request applied here, *after* it
+        returned and before its output is persisted. Applying it any earlier would let an
+        attempt that expanded and then failed leave its nodes behind for the retry to trip
+        over; applying it any later would mark the node ``SUCCESS`` while the graph it
+        promised to grow had not grown.
+        """
         agent = self._registry.create(node.agent)
         inputs = await self._resolve_inputs(run_id, node)
+        expansion = Expansion()
         context = AgentContext(
             run_id=run_id,
             node_id=node.id,
@@ -310,6 +353,7 @@ class Executor:
             inputs=inputs,
             params=node.params,
             clock=self._clock,
+            expansion=expansion,
             # Budget outermost, so a refused call is never recorded: there is no response
             # to replay. Inside it, a per-node recorder over the run's shared client, so
             # every call this attempt makes lands in the run record for replay (FR-8).
@@ -335,7 +379,33 @@ class Executor:
             self._policy.limits.slot(self._model.provider),
             asyncio.timeout(policy.timeout_s),
         ):
-            return await agent.run(context)
+            output = await agent.run(context)
+
+        await self._apply_expansion(run_id, node.id, graph, expansion)
+        return output
+
+    async def _apply_expansion(
+        self, run_id: str, node_id: str, graph: RunGraph, expansion: Expansion
+    ) -> None:
+        """Merge a node's requested expansion into the run, and persist the result.
+
+        ``graph.apply`` is synchronous, so validate-and-merge cannot interleave with
+        another node's expansion — the serialisation ARCHITECTURE §4 promises comes from
+        the absence of an ``await``, not from a lock.
+
+        Raises:
+            ValidationError: If the expansion is rejected. It reaches the caller as an
+                ordinary node failure, and the default retry classification does not retry
+                it, so a planner that emits a cycle fails itself and nothing else. The run
+                carries on and terminates normally rather than deadlocking.
+        """
+        added = graph.apply(node_id, expansion)
+        if not added:
+            return
+
+        await self._store.save_workflow(run_id, graph.workflow)
+        for new in added:
+            await self._record(run_id, new.id, NodeState.PENDING)
 
     async def _resolve_inputs(self, run_id: str, node: Node) -> Mapping[str, NodeOutput]:
         """Read this node's declared inputs out of its upstream nodes' stored outputs.
@@ -521,7 +591,7 @@ class Executor:
             )
         )
 
-    def _derive_run_state(self, states: Mapping[str, NodeState]) -> RunState:
+    def _derive_run_state(self, workflow: Workflow, states: Mapping[str, NodeState]) -> RunState:
         """Turn the final node states, and the budget, into the run's outcome.
 
         The budget comes first: if it refused work, that is *why* the run ended the way it
@@ -534,6 +604,11 @@ class Executor:
         """
         if self._policy.budget.refused:
             return RunState.BUDGET_EXCEEDED
-        if all(state is NodeState.SUCCESS for state in states.values()):
+        # Over the graph's nodes, not over `states`: a node added by an expansion and then
+        # never dispatched is absent from `states`, and a run is not a success because
+        # nobody got round to one of its nodes.
+        if all(
+            states.get(node.id, NodeState.PENDING) is NodeState.SUCCESS for node in workflow.nodes
+        ):
             return RunState.SUCCEEDED
         return RunState.FAILED

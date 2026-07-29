@@ -7,6 +7,7 @@ opaque agents and knows nothing about what any of them do.
 from dagent.runtime.agent import Agent, AgentContext
 from dagent.runtime.clock import Clock, ManualClock, SystemClock
 from dagent.runtime.executor import Executor
+from dagent.runtime.expansion import Expansion, RunGraph
 from dagent.runtime.metering import BudgetedModelClient
 from dagent.runtime.model import ModelClient, NullModelClient, StubModelClient
 from dagent.runtime.recording import RecordingModelClient
@@ -25,10 +26,12 @@ __all__ = [
     "BudgetedModelClient",
     "Clock",
     "Executor",
+    "Expansion",
     "ManualClock",
     "ModelClient",
     "NullModelClient",
     "RecordingModelClient",
+    "RunGraph",
     "StubModelClient",
     "SystemClock",
     "default_registry",

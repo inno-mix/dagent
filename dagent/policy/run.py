@@ -62,6 +62,26 @@ class RunPolicy:
     limits: Limits = field(default_factory=Limits)
     budget: Budget = field(default_factory=Budget)
     backoff: Backoff = field(default_factory=Backoff)
+    max_expansion_depth: int = 1
+    """How many generations of dynamic expansion a run allows (FR-7).
+
+    One by default: a planner may grow the graph, and what it grows may not grow further.
+    That covers the showcase workflow and stops an agent that emits a copy of itself from
+    running until the budget or the node ceiling notices. Set 0 to forbid expansion
+    outright, or higher for a planner of planners.
+
+    Counted in memory, per run: a resumed run treats everything already in the stored
+    graph as generation zero, so depth alone does not bound a run across many crashes.
+    :attr:`max_graph_nodes` is the bound that does, because it is measured against the
+    persisted graph.
+    """
+    max_graph_nodes: int = 1000
+    """A ceiling on the size of the graph however it got that big.
+
+    Not inert, unlike the other limits, because this one is a runaway guard rather than a
+    policy choice — and 1000 nodes is already an order of magnitude past what SPEC's
+    performance target contemplates for v1.
+    """
     price: Pricer = field(default=free)
     """Turns a model response into a cost, for the budget's dollar ceiling. Defaults to
     free, because no price table ships with the engine — see :func:`~dagent.policy.limits.free`.
