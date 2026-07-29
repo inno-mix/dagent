@@ -8,6 +8,7 @@ from dagent.cli import app
 from dagent.errors import ValidationError
 from dagent.runtime.executor import Executor
 from dagent.runtime.model import StubModelClient
+from dagent.store import POSTGRES_DSN_ENV
 
 runner = CliRunner()
 
@@ -199,3 +200,71 @@ def test_run_rejects_a_concurrency_cap_of_zero() -> None:
 
     assert result.exit_code == 2
     assert "at least 1" in result.output
+
+
+# --- Phase 5: stores and resume -------------------------------------------------------
+
+
+def test_run_accepts_the_memory_store_explicitly() -> None:
+    result = runner.invoke(app, ["run", EXAMPLE, "--provider", "stub", "--store", "memory"])
+
+    assert result.exit_code == 0
+
+
+def test_run_rejects_an_unknown_store() -> None:
+    result = runner.invoke(app, ["run", EXAMPLE, "--provider", "stub", "--store", "nope"])
+
+    assert result.exit_code == 2
+    assert "unknown store" in result.output
+
+
+def test_asking_for_postgres_without_a_dsn_says_which_variable_to_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(POSTGRES_DSN_ENV, raising=False)
+
+    result = runner.invoke(app, ["run", EXAMPLE, "--provider", "stub", "--store", "postgres"])
+
+    assert result.exit_code == 2
+    assert POSTGRES_DSN_ENV in result.output
+
+
+def test_resume_needs_a_run_id() -> None:
+    result = runner.invoke(app, ["resume"])
+
+    assert result.exit_code == 2
+
+
+def test_resume_from_the_memory_store_reports_the_missing_run() -> None:
+    # A fresh process has an empty in-memory store, which is exactly why `resume`
+    # defaults to Postgres. The message should still be legible if someone tries.
+    result = runner.invoke(app, ["resume", "whatever", "--provider", "stub", "--store", "memory"])
+
+    assert result.exit_code == 2
+    assert "unknown run" in result.output
+
+
+def test_resume_appears_in_the_help() -> None:
+    result = runner.invoke(app, ["--help"])
+
+    assert "resume" in result.output
+
+
+def test_a_bad_postgres_dsn_is_reported_rather_than_crashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The store is opened before anything runs, so an unreachable database costs a
+    # message, not a traceback.
+    monkeypatch.setenv(POSTGRES_DSN_ENV, "postgresql://nobody:nobody@127.0.0.1:1/none")
+
+    result = runner.invoke(app, ["run", EXAMPLE, "--provider", "stub", "--store", "postgres"])
+
+    assert result.exit_code == 2
+    assert "cannot connect to Postgres" in result.output
+
+
+def test_resume_rejects_an_unknown_failure_mode_before_touching_the_store() -> None:
+    result = runner.invoke(app, ["resume", "r1", "--on-failure", "panic"])
+
+    assert result.exit_code == 2
+    assert "unknown failure mode" in result.output

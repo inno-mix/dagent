@@ -6,34 +6,18 @@ outermost, so a refused call never reaches the recorder — there is no response
 and a replay must not find a call that never happened.
 
 Lives in ``runtime`` rather than ``policy`` because it is the one piece of the budget story
-that has to know what a model call *is*. :class:`~dagent.policy.limits.Budget` itself holds
-numbers only, so ``dagent.policy`` keeps its clean one-way dependency on ``dagent.models``.
+that has to know about the model *seam*. The budget and its pricing know only about
+``ModelResponse``, a plain schema, so ``dagent.policy`` keeps its one-way dependency on
+``dagent.models`` and the package stays importable.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import TypeAlias
-
 from dagent.models.model_call import ModelRequest, ModelResponse
-from dagent.policy.limits import Budget
+from dagent.policy.limits import Budget, Pricer, free
 from dagent.runtime.model import ModelClient
 
-__all__ = ["BudgetedModelClient", "Pricer", "free"]
-
-Pricer: TypeAlias = Callable[[ModelResponse], float]
-"""Turns a response into what it cost, in USD."""
-
-
-def free(response: ModelResponse) -> float:
-    """Price every call at zero — the default.
-
-    No price table ships in this package on purpose. Per-token prices are vendor knowledge
-    that changes without warning, and a stale table baked into an execution engine reports
-    confident, wrong numbers. The token ceiling is exact and needs no table; a run that
-    wants a dollar ceiling supplies the pricing it trusts.
-    """
-    return 0.0
+__all__ = ["BudgetedModelClient"]
 
 
 class BudgetedModelClient:

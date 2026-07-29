@@ -83,8 +83,10 @@ No async, no I/O — trivially unit- and property-testable, and enforced by
 
 ### Runtime (`dagent/runtime`)
 - `agent.py` — the `Agent` `Protocol` (`async def run(ctx) -> Output`) and
-  `AgentContext` (resolved inputs, `run_id`/`node_id`, injected `Clock`, model client
-  factory, `Budget` handle). Context is how we keep agents pure and replayable.
+  `AgentContext` (resolved inputs, `params`, `run_id`/`node_id`/`attempt`, the injected
+  `Clock`, and the model client). Context is how we keep agents pure and replayable.
+  `ctx.idempotency_key` renders `(run_id, node_id, attempt)` as a string an agent can
+  hand straight to whatever the outside world dedupes on — see §4.
 - `clock.py` — the `Clock` `Protocol` (`now`, `sleep`) with `SystemClock` for production
   and `ManualClock` for tests. `SystemClock` is the only code in the package that touches
   real time.
@@ -110,9 +112,12 @@ No async, no I/O — trivially unit- and property-testable, and enforced by
   depends on. Re-registering a name raises rather than silently replacing — otherwise a
   workflow's behaviour would depend on import order.
 - `executor.py` — the scheduler. Owns the run loop, the ready-set recomputation, the
-  concurrency permits, and the handoff to the policy layer. This is the heart of the
-  project; keep it under tight test. `run_id` is supplied by the caller rather than
-  minted here, so no run depends on an id it cannot reproduce.
+  concurrency permits, the handoff to the policy layer, and `resume`. A fresh run and a
+  resumed one share one loop: `run` seeds it with every node `PENDING`, `resume` seeds it
+  from the store. A resume that went down a second code path would be a second set of
+  scheduling bugs, and the claim of DR-4 is precisely that resume is *not* special.
+  This is the heart of the project; keep it under tight test. `run_id` is supplied by
+  the caller rather than minted here, so no run depends on an id it cannot reproduce.
 
 ### Policy (`dagent/policy`)
 Computes; never acts. This package decides *how long* to wait, *whether* a failure earns
@@ -149,10 +154,24 @@ The token ceiling is exact and needs no table; a run wanting a dollar ceiling in
 pricing it trusts (`runtime/metering.py`'s `Pricer`).
 
 ### Store (`dagent/store`)
-`StateStore` `Protocol`: `save_node_state`, `load_run`, `append_output`, `load_output`,
-`checkpoint`. Two impls: `memory.py` (v1, dict-backed) and `postgres.py` (v2,
-`asyncpg`). All durability semantics live behind this protocol so the executor is
-storage-agnostic.
+`StateStore` `Protocol`: `checkpoint`, `save_workflow`, `save_node_state`,
+`append_output`, `append_model_call`, `load_run`, `load_workflow`, `load_output`,
+`load_model_calls`. Two impls: `memory.py` (v1, dict-backed) and `postgres.py`
+(`asyncpg`, behind the `postgres` extra). All durability semantics live behind this
+protocol so the executor is storage-agnostic — a claim only worth making if both
+implementations actually agree, which is what `tests/store/test_conformance.py` runs the
+same contract against each of them to establish.
+
+The **definition is persisted with the run** (`save_workflow`), which is what lets
+`resume(run_id)` take no other argument. Rebuilding the graph from the original file
+instead would work today and break in Phase 6, where a planner adds nodes at run time that
+no file contains. It is a separate write rather than a field on `RunStateRecord` because
+`checkpoint` replaces the whole record on every run-level transition, and a graph is a lot
+of bytes to rewrite in order to say "still going".
+
+Every write is safe to repeat. A resumed node re-writes the state and output it may
+already have written, so the Postgres impl is entirely `INSERT ... ON CONFLICT DO UPDATE`
+— Phase 8's at-least-once requirement arriving early, on purpose (DR-4).
 
 `load_output` is what lets the executor resolve a node's inputs *through the store*
 rather than from an in-process cache, keeping the store the single source of truth — and
@@ -160,10 +179,17 @@ turning Phase 5's resume into a reload rather than a reconstruction. A missing r
 output raises `StoreError` rather than returning `None`, because `None` is itself a legal
 output and absence has to be signalled out of band.
 
-Two ordering guarantees the executor makes and an implementation may rely on: run-level
-state is written before the first node starts, and a node's output is written *before*
-that node is marked `SUCCESS`, so a node found `SUCCESS` on reload always has an output
-to read.
+Three ordering guarantees the executor makes and an implementation may rely on: the
+definition is written before the run record, so a run that exists can always be resumed;
+run-level state is written before the first node starts; and a node's output is written
+*before* that node is marked `SUCCESS`, so a node found `SUCCESS` on reload always has an
+output to read.
+
+That first rule has a visible consequence in the Postgres schema: `dagent_workflow` is the
+one table with no foreign key back to `dagent_run`, because a foreign key would demand the
+parent row first and invert the guarantee. Of the two torn writes available — a definition
+with no run, or a run with no definition — the first is an orphan row and the second is a
+run nobody can continue.
 
 ### Agents (`dagent/agents`)
 Concrete implementations: `planner`, `researcher`, `synthesizer`, `critic` — plus the
@@ -243,13 +269,28 @@ Completions are therefore folded in declaration order, the same tiebreak `ready_
 ## 4. The hard problems (this is the senior signal)
 
 ### Durable, resumable execution
-State transitions are written **before** side effects where possible, and each node
-run carries an idempotency key `(run_id, node_id, attempt)`. On resume, the executor
-loads persisted state and: any node already `SUCCESS` is skipped; any node `RUNNING`
-at crash time is re-dispatched, and because the agent's side effect is guarded by the
-idempotency key, re-execution does not double-commit. The design principle:
-**make re-execution safe first, then make resume trivial.** This is deliberately the
-Temporal problem in miniature, and the README should say so.
+State transitions are written **before** side effects where possible, and each node run
+carries an idempotency key `(run_id, node_id, attempt)`, surfaced to agents as
+`ctx.idempotency_key`. On resume, the executor loads persisted state and:
+
+| Node was left | Resume does |
+|---|---|
+| `SUCCESS` | skips it — its output is already in the store for dependents to read |
+| `RUNNING` / `READY` | re-dispatches it **at the same attempt number** |
+| `FAILED` / `SKIPPED` | leaves it; a verdict was reached |
+| `PENDING` | picks it up normally |
+
+The same-attempt rule is the whole design. A crash cannot tell you whether the side effect
+landed before the process died, so the node comes back under the key the outside world has
+already seen, and an agent that deduplicates on that key commits exactly once. A retry
+after a *definite* failure is a different matter and gets a fresh attempt, because that
+work provably did not complete.
+
+Budget usage is rebuilt from the recorded model calls before anything re-runs — a per-run
+ceiling that reset itself on every crash would be a ceiling per crash.
+
+The design principle: **make re-execution safe first, then make resume trivial.** This is
+deliberately the Temporal problem in miniature, and the README should say so.
 
 ### Dynamic DAG expansion
 A planner returns new node definitions. The executor: (1) revalidates the *augmented*
@@ -338,7 +379,16 @@ retrying it buys three identical stack traces and three times the latency. *Reje
 retrying every exception (turns bugs into slow bugs), or a central table of retryable
 types (puts vendor knowledge in the core and goes stale silently).
 
-**DR-8: Timeouts are measured by the event loop, not by the injected `Clock`.**
+**DR-8: The workflow definition is persisted with the run, and `resume` takes only a
+run id.** The alternative — hand `resume` the file again — is what Airflow and Temporal do,
+and it is defensible: the definition is code, the state is data. It breaks the moment a
+planner grows the graph at run time (Phase 6, FR-7), because the augmented graph exists in
+no file. Storing it also removes a whole class of bug where a run silently continues
+against an edited definition. *Rejected:* reconstructing from the file (unresumable once
+expansion lands), and embedding the graph in `RunStateRecord` (rewritten on every
+checkpoint, and it would make `models/state.py` import `models/workflow.py` in a cycle).
+
+**DR-9: Timeouts are measured by the event loop, not by the injected `Clock`.**
 Every other read of time in dagent goes through the `Clock` seam, including retry backoff
 — which is why a test can assert a run waited four seconds without waiting. Timeouts are
 the deliberate exception: cancelling a coroutine at a deadline is something only the loop's

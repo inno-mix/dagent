@@ -16,6 +16,7 @@ import asyncio
 from collections.abc import Mapping
 from datetime import datetime
 
+from dagent.errors import StoreError, ValidationError
 from dagent.graph.topo import descendants, nodes_by_id, ready_set
 from dagent.graph.validate import validate
 from dagent.models.state import (
@@ -36,6 +37,15 @@ from dagent.runtime.registry import AgentRegistry
 from dagent.store.base import StateStore
 
 __all__ = ["Executor"]
+
+_INTERRUPTED = frozenset({NodeState.PENDING, NodeState.READY, NodeState.RUNNING})
+"""Node states a resumed run re-dispatches.
+
+``PENDING`` never started. ``READY`` was dispatched but may not have reached its agent.
+``RUNNING`` was mid-flight when the process died, and nothing on this side of the crash
+can tell you how far it got — which is exactly why it comes back under the same
+idempotency key rather than a fresh one.
+"""
 
 
 class Executor:
@@ -87,21 +97,87 @@ class Executor:
             The run's final state, read back from the store.
 
         Raises:
-            ValidationError: If the workflow is invalid or names an unregistered agent.
-                Nothing executes and nothing is written in that case.
+            ValidationError: If the workflow is invalid, names an unregistered agent, or
+                ``run_id`` is already taken. Nothing executes and nothing is written.
             CancelledError: If the caller cancels the run. Every node in flight is stopped
                 first and the run is checkpointed ``CANCELLED`` before this propagates.
         """
         # Submit-time validation, with the registry injected — this is the caller that
         # actually has one, which is why graph/ takes it as a parameter.
         validate(workflow, known_agents=self._registry.names())
+        await self._require_unused(run_id)
 
-        nodes = nodes_by_id(workflow)
-        states: dict[str, NodeState] = dict.fromkeys(nodes, NodeState.PENDING)
-        # Declaration order, so a batch of completions is folded in the same sequence
-        # every time — see the comment on `declared` below.
-        declared = {node_id: index for index, node_id in enumerate(nodes)}
+        states: dict[str, NodeState] = dict.fromkeys(nodes_by_id(workflow), NodeState.PENDING)
         await self._open_run(run_id, workflow, states)
+        return await self._drive(run_id, workflow, states, attempts={})
+
+    async def resume(self, run_id: str) -> RunStateRecord:
+        """Continue a run that was interrupted, and return its final state.
+
+        Takes no workflow: the definition was persisted with the run, so resuming cannot
+        pick up a different graph than the one that was interrupted — and a Phase 6 graph
+        that a planner grew at run time is resumable even though no file describes it.
+
+        What each node does depends only on the state it was left in:
+
+        * ``SUCCESS`` — skipped. Its output is already in the store, so its dependents can
+          read it without the node running again.
+        * ``RUNNING`` or ``READY`` — interrupted, and re-dispatched **at the same attempt
+          number**. A crash cannot tell you whether the side effect landed, so the node
+          re-runs under the same idempotency key the outside world already saw.
+        * ``FAILED`` or ``SKIPPED`` — a decision was reached; resume does not revisit it.
+        * ``PENDING`` — never started, and picked up normally.
+
+        Budget usage is rebuilt from the recorded model calls before anything runs. A
+        per-run ceiling that reset itself every time the process died would not be a
+        per-run ceiling.
+
+        Raises:
+            StoreError: If the run or its definition is not in the store.
+            ValidationError: If the run already succeeded — there is nothing to continue —
+                or if the stored definition no longer validates, which is what a since
+                removed agent looks like.
+        """
+        run = await self._store.load_run(run_id)
+        if run.state is RunState.SUCCEEDED:
+            raise ValidationError(f"run {run_id!r} already succeeded; there is nothing to resume")
+
+        workflow = await self._store.load_workflow(run_id)
+        validate(workflow, known_agents=self._registry.names())
+
+        states: dict[str, NodeState] = {}
+        attempts: dict[str, int] = {}
+        for node_id in nodes_by_id(workflow):
+            record = run.nodes.get(node_id)
+            if record is None or record.state in _INTERRUPTED:
+                # Back to PENDING so ready_set offers it again — carrying the attempt it
+                # was on, which is what keeps the idempotency key stable across the crash.
+                states[node_id] = NodeState.PENDING
+                attempts[node_id] = record.attempt if record is not None else 0
+                continue
+            states[node_id] = record.state
+
+        await self._rehydrate_budget(run_id)
+        await self._checkpoint(run_id, RunState.RUNNING)
+        return await self._drive(run_id, workflow, states, attempts)
+
+    async def _drive(
+        self,
+        run_id: str,
+        workflow: Workflow,
+        states: dict[str, NodeState],
+        attempts: Mapping[str, int],
+    ) -> RunStateRecord:
+        """The run loop, shared by a fresh run and a resumed one.
+
+        There is exactly one of these on purpose: a resume that went down a second code
+        path would be a second set of scheduling bugs, and the whole claim of DR-4 is that
+        resume is *not* special — it is the same loop over reloaded state.
+        """
+        nodes = nodes_by_id(workflow)
+        # Declaration order, so a batch of completions is folded in the same sequence
+        # every time — see the comment where `declared` is used below.
+        declared = {node_id: index for index, node_id in enumerate(nodes)}
 
         in_flight: dict[asyncio.Task[NodeState], str] = {}
         halted = False
@@ -112,9 +188,13 @@ class Executor:
                         # Mark READY before dispatching: ready_set only offers PENDING
                         # nodes, so this is what stops the next pass re-dispatching one.
                         states[node_id] = NodeState.READY
-                        await self._record(run_id, node_id, NodeState.READY)
+                        await self._record(
+                            run_id, node_id, NodeState.READY, attempt=attempts.get(node_id, 0)
+                        )
                         task = asyncio.create_task(
-                            self._execute(run_id, nodes[node_id]),
+                            self._execute(
+                                run_id, nodes[node_id], first_attempt=attempts.get(node_id, 0)
+                            ),
                             name=f"dagent:{run_id}:{node_id}",
                         )
                         in_flight[task] = node_id
@@ -154,8 +234,15 @@ class Executor:
 
     # --- one node -------------------------------------------------------------------
 
-    async def _execute(self, run_id: str, node: Node) -> NodeState:
+    async def _execute(self, run_id: str, node: Node, *, first_attempt: int = 0) -> NodeState:
         """Run one node under its own task, retrying as its policy allows.
+
+        Args:
+            run_id: The run this node belongs to.
+            node: The node to execute.
+            first_attempt: Where to start counting. Non-zero only on resume, where an
+                interrupted node re-runs under the attempt — and therefore the
+                idempotency key — it was already using when the process died.
 
         Returns:
             ``SUCCESS`` once an attempt produced an output, or ``FAILED`` when the
@@ -163,7 +250,7 @@ class Executor:
         """
         policy = self._policy.policy_for(node.policy)
         started = self._clock.now()
-        attempt = 0
+        attempt = first_attempt
 
         while True:
             await self._record(
@@ -236,6 +323,7 @@ class Executor:
                     clock=self._clock,
                 ),
                 budget=self._policy.budget,
+                price=self._policy.price,
             ),
         )
 
@@ -343,11 +431,47 @@ class Executor:
 
     # --- persistence ------------------------------------------------------------------
 
+    async def _require_unused(self, run_id: str) -> None:
+        """Refuse to start a run over the top of one that already exists.
+
+        Before anything was durable this was harmless. Now it would overwrite a run that
+        could have been resumed, which is a data-loss bug wearing the costume of a typo.
+
+        Raises:
+            ValidationError: If ``run_id`` is already in the store.
+        """
+        try:
+            await self._store.load_run(run_id)
+        except StoreError:
+            return
+        raise ValidationError(
+            f"run {run_id!r} already exists; use resume({run_id!r}) to continue it, "
+            "or choose a different run id"
+        )
+
+    async def _rehydrate_budget(self, run_id: str) -> None:
+        """Charge the budget for everything this run spent before it was interrupted.
+
+        Exact rather than approximate: the recorded responses carry their own token counts
+        and are re-priced through the same :data:`~dagent.policy.limits.Pricer` a fresh run
+        would use. A ceiling that reset itself on every crash would not be a ceiling.
+        """
+        for call in await self._store.load_model_calls(run_id):
+            self._policy.budget.charge(
+                tokens=call.response.total_tokens,
+                cost_usd=self._policy.price(call.response),
+            )
+
     async def _open_run(
         self, run_id: str, workflow: Workflow, states: Mapping[str, NodeState]
     ) -> None:
-        """Write the run and its initial node states before anything executes."""
+        """Write the definition, then the run and its initial node states.
+
+        Definition first: a run record that exists must always have a definition behind
+        it, or ``resume`` would find a run it cannot continue.
+        """
         opened = self._clock.now()
+        await self._store.save_workflow(run_id, workflow)
         await self._store.checkpoint(
             RunStateRecord(
                 run_id=run_id,

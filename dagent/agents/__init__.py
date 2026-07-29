@@ -6,9 +6,9 @@ only the ``Agent`` and ``ModelClient`` protocols.
 
 Importing this package registers its agents on ``dagent.runtime.default_registry`` under
 the names a workflow file uses: ``researcher``, ``synthesizer``, ``constant``, ``fake``,
-``echo``. The agents built to misbehave — ``FailingAgent``, ``FlakyAgent``,
-``HangingAgent`` — are exported but deliberately unregistered, so no workflow can name
-one by accident.
+``echo``. The agents built to misbehave or to need injection — ``FailingAgent``,
+``FlakyAgent``, ``HangingAgent``, ``SideEffectAgent`` — are exported but deliberately
+unregistered, so no workflow can name one by accident.
 """
 
 from dagent.agents.fake import (
@@ -18,6 +18,7 @@ from dagent.agents.fake import (
     FakeAgent,
     FlakyAgent,
     HangingAgent,
+    SideEffectAgent,
 )
 from dagent.agents.gemini import GeminiClient
 from dagent.agents.researcher import ResearcherAgent
@@ -32,5 +33,6 @@ __all__ = [
     "GeminiClient",
     "HangingAgent",
     "ResearcherAgent",
+    "SideEffectAgent",
     "SynthesizerAgent",
 ]

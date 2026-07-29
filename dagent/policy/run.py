@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from dagent.models.workflow import Policy
-from dagent.policy.limits import Budget, Limits
+from dagent.policy.limits import Budget, Limits, Pricer, free
 from dagent.policy.retry import Backoff, Retryable, default_retryable
 
 __all__ = ["FailureMode", "RunPolicy"]
@@ -62,6 +62,10 @@ class RunPolicy:
     limits: Limits = field(default_factory=Limits)
     budget: Budget = field(default_factory=Budget)
     backoff: Backoff = field(default_factory=Backoff)
+    price: Pricer = field(default=free)
+    """Turns a model response into a cost, for the budget's dollar ceiling. Defaults to
+    free, because no price table ships with the engine — see :func:`~dagent.policy.limits.free`.
+    A resumed run re-prices its recorded calls through this, so the ceiling survives a crash."""
     retryable: Retryable = field(default=default_retryable)
     """Decides whether a failed attempt earns another one. Swap it to change the rules
     without touching the executor."""

@@ -9,24 +9,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import pathlib
-from collections.abc import Mapping
-from typing import Annotated
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Annotated, TypeAlias
 
 import typer
 
 import dagent.agents  # noqa: F401  — imported for the side effect of registering agents
 from dagent import __version__
-from dagent.errors import DagentError, PolicyError
+from dagent.errors import DagentError, PolicyError, StoreError
 from dagent.graph.validate import validate as validate_graph
 from dagent.loader import load_workflow_file
-from dagent.models.state import NodeState, NodeStateRecord, RunState
+from dagent.models.state import NodeState, NodeStateRecord, RunState, RunStateRecord
 from dagent.models.workflow import Workflow
 from dagent.policy.limits import Budget, Limits
 from dagent.policy.run import FailureMode, RunPolicy
 from dagent.runtime.executor import Executor
 from dagent.runtime.model import ModelClient, NullModelClient, StubModelClient
 from dagent.runtime.registry import default_registry
+from dagent.store import POSTGRES_DSN_ENV
 from dagent.store.base import StateStore
 from dagent.store.memory import InMemoryStateStore
 
@@ -89,6 +91,9 @@ def run(
         str,
         typer.Option(help="run_to_completion | fail_fast | skip_downstream."),
     ] = FailureMode.RUN_TO_COMPLETION.value,
+    store: Annotated[
+        str, typer.Option(help=f"State store: 'memory', or 'postgres' via ${POSTGRES_DSN_ENV}.")
+    ] = "memory",
 ) -> None:
     """Run a workflow end to end and report what each node did.
 
@@ -112,10 +117,71 @@ def run(
         raise typer.Exit(2) from exc
 
     code = asyncio.run(
-        _execute(
-            workflow,
+        _drive(
+            _start(workflow, run_id=run_id),
             run_id=run_id,
             provider=provider,
+            store=store,
+            show_outputs=show_outputs,
+            policy=policy,
+        )
+    )
+    raise typer.Exit(code)
+
+
+@app.command()
+def resume(
+    run_id: Annotated[str, typer.Argument(help="Identifier of the run to continue.")],
+    provider: Annotated[
+        str, typer.Option(help="Model provider: 'gemini', 'stub' for a dry run, or 'none'.")
+    ] = "gemini",
+    show_outputs: Annotated[bool, typer.Option(help="Print each node's output.")] = True,
+    max_concurrency: Annotated[
+        int | None, typer.Option(help="Cap on nodes running at once. Default: unlimited.")
+    ] = None,
+    provider_concurrency: Annotated[
+        int | None, typer.Option(help="Cap on nodes per provider. Default: unlimited.")
+    ] = None,
+    max_tokens: Annotated[
+        int | None, typer.Option(help="Token ceiling for the whole run. Default: unlimited.")
+    ] = None,
+    on_failure: Annotated[
+        str,
+        typer.Option(help="run_to_completion | fail_fast | skip_downstream."),
+    ] = FailureMode.RUN_TO_COMPLETION.value,
+    store: Annotated[
+        str, typer.Option(help=f"State store: 'postgres' via ${POSTGRES_DSN_ENV}, or 'memory'.")
+    ] = "postgres",
+) -> None:
+    """Continue a run that was interrupted, from wherever it got to.
+
+    Takes no workflow file: the definition was stored with the run, so a resumed run
+    cannot drift onto a different graph than the one that was interrupted.
+
+    Defaults to the Postgres store, because that is the only one whose state outlives the
+    process that crashed — resuming from memory in a fresh process has nothing to read.
+
+    Nodes that already succeeded are skipped. Nodes that were mid-flight are re-dispatched
+    under the same idempotency key they were already using, so an agent that deduplicates
+    on ``ctx.idempotency_key`` commits its effect exactly once across the crash.
+    """
+    try:
+        policy = _run_policy(
+            max_concurrency=max_concurrency,
+            provider_concurrency=provider_concurrency,
+            max_tokens=max_tokens,
+            on_failure=on_failure,
+        )
+    except DagentError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2) from exc
+
+    code = asyncio.run(
+        _drive(
+            _continue(run_id),
+            run_id=run_id,
+            provider=provider,
+            store=store,
             show_outputs=show_outputs,
             policy=policy,
         )
@@ -179,35 +245,96 @@ def _model_client(provider: str) -> ModelClient:
     raise DagentError(f"unknown provider {provider!r}; expected 'gemini', 'stub', or 'none'")
 
 
-async def _execute(
-    workflow: Workflow,
+Drive: TypeAlias = Callable[[Executor], Awaitable[RunStateRecord]]
+"""What to ask the executor to do — start a workflow, or continue a run."""
+
+
+def _start(workflow: Workflow, *, run_id: str) -> Drive:
+    """Begin a new run."""
+
+    async def go(executor: Executor) -> RunStateRecord:
+        return await executor.run(workflow, run_id=run_id)
+
+    return go
+
+
+def _continue(run_id: str) -> Drive:
+    """Pick a run back up from the store."""
+
+    async def go(executor: Executor) -> RunStateRecord:
+        return await executor.resume(run_id)
+
+    return go
+
+
+async def _open_store(kind: str) -> StateStore:
+    """Open the state store the caller asked for.
+
+    Raises:
+        DagentError: If the kind is unknown, or Postgres was asked for without a DSN.
+    """
+    if kind == "memory":
+        return InMemoryStateStore()
+    if kind == "postgres":
+        dsn = os.environ.get(POSTGRES_DSN_ENV)
+        if not dsn:
+            raise StoreError(
+                f"{POSTGRES_DSN_ENV} is not set; export a Postgres DSN, or pass --store memory "
+                "for a run that does not need to outlive this process"
+            )
+        # Imported here so `dagent` stays usable with the `postgres` extra uninstalled.
+        from dagent.store.postgres import PostgresStateStore
+
+        return await PostgresStateStore.connect(dsn)
+    raise StoreError(f"unknown store {kind!r}; expected 'memory' or 'postgres'")
+
+
+async def _drive(
+    drive: Drive,
     *,
     run_id: str,
     provider: str,
+    store: str,
     show_outputs: bool,
     policy: RunPolicy,
 ) -> int:
-    """Execute the workflow, print a report, and return the process exit code."""
-    store = InMemoryStateStore()
-
+    """Execute or resume, print a report, and return the process exit code."""
     try:
+        state_store = await _open_store(store)
         client = _model_client(provider)
     except DagentError as exc:
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
         return 2
 
     try:
-        result = await Executor(
-            registry=default_registry, store=store, model=client, policy=policy
-        ).run(workflow, run_id=run_id)
+        result = await drive(
+            Executor(registry=default_registry, store=state_store, model=client, policy=policy)
+        )
     except DagentError as exc:
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
         return 2
     finally:
-        closer = getattr(client, "aclose", None)
+        await _aclose(client)
+
+    try:
+        return await _report(state_store, result, policy=policy, show_outputs=show_outputs)
+    finally:
+        await _aclose(state_store)
+
+
+async def _aclose(resource: object) -> None:
+    """Close a client or store that has something to close."""
+    for name in ("aclose", "close"):
+        closer = getattr(resource, name, None)
         if closer is not None:
             await closer()
+            return
 
+
+async def _report(
+    store: StateStore, result: RunStateRecord, *, policy: RunPolicy, show_outputs: bool
+) -> int:
+    """Print what the run did and return the process exit code."""
     typer.echo(f"run {result.run_id}: {result.state}")
     for node_id in sorted(result.nodes):
         record = result.nodes[node_id]

@@ -245,3 +245,53 @@ def test_the_layering_scan_actually_covers_files() -> None:
     assert LAYERED_FILES
     covered = {path.relative_to(PACKAGE_ROOT).parts[0] for path in LAYERED_FILES}
     assert covered == set(ALLOWED_DEPENDENCIES)
+
+
+OPTIONAL_DEPENDENCIES = {
+    "asyncpg": "dagent/store/postgres.py",
+}
+"""Packages that are extras, and the one module allowed to import each.
+
+`asyncpg` ships under `dagent[postgres]`. If any other module imports it — the CLI
+naming the store in a help string, say — then a plain `pip install dagent` produces a
+package that cannot be imported at all, and SPEC's "v1 runs with zero external services"
+becomes false in the most embarrassing way possible.
+"""
+
+
+@pytest.mark.parametrize("path", ALL_FILES, ids=_ids(ALL_FILES))
+def test_an_optional_dependency_is_imported_only_where_it_is_allowed(
+    path: pathlib.Path,
+) -> None:
+    relative = str(path.relative_to(REPO_ROOT))
+    offenders = sorted(
+        module
+        for module in _imported_modules(path)
+        if (owner := OPTIONAL_DEPENDENCIES.get(module.split(".")[0])) is not None
+        and owner != relative
+    )
+
+    assert not offenders, (
+        f"{relative} imports the optional dependency {offenders}. Only "
+        f"{[OPTIONAL_DEPENDENCIES[m.split('.')[0]] for m in offenders]} may, or the base "
+        "install stops importing."
+    )
+
+
+def test_no_optional_dependency_is_declared_in_the_base_install() -> None:
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    base = {_requirement_name(requirement) for requirement in data["project"]["dependencies"]}
+
+    assert not base & set(OPTIONAL_DEPENDENCIES), "an extra leaked into the base install"
+
+
+def test_each_optional_dependency_has_an_extra_that_provides_it() -> None:
+    # An "optional" dependency nobody can install is just a missing one.
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = {
+        _requirement_name(requirement)
+        for group in data["project"].get("optional-dependencies", {}).values()
+        for requirement in group
+    }
+
+    assert set(OPTIONAL_DEPENDENCIES) <= extras

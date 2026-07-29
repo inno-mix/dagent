@@ -21,6 +21,7 @@ __all__ = [
     "FakeAgent",
     "FlakyAgent",
     "HangingAgent",
+    "SideEffectAgent",
 ]
 
 
@@ -122,6 +123,41 @@ class FlakyAgent:
                 f"node {ctx.node_id!r} failed on attempt {ctx.attempt}", retryable=True
             )
         return {"node_id": ctx.node_id, "attempt": ctx.attempt}
+
+
+class SideEffectAgent:
+    """Commits an effect to an outside world, exactly once, using the idempotency key.
+
+    The engine can guarantee that a node is *re-executed* after a crash. It cannot
+    guarantee that the node's effect on some other system did not already land — nothing
+    on this side of a dead process can know that. What it can do is hand every attempt a
+    stable name for the work, and this agent shows the pattern that name exists for:
+    check, then commit under the key.
+
+    That is DR-4 made concrete. Get this right and resume is just a reload; get it wrong
+    and resume is a machine for double-charging people.
+
+    Not registered: it needs a ledger injected, so a workflow file cannot name it.
+    """
+
+    def __init__(self, ledger: dict[str, NodeOutput]) -> None:
+        """Commit into ``ledger``, standing in for whatever the real outside world is."""
+        self.ledger = ledger
+        self.commits = 0
+        """How many times an effect was actually committed — the number a test asserts on."""
+
+    async def run(self, ctx: AgentContext) -> NodeOutput:
+        """Commit this node's effect if the key has not already been used."""
+        if ctx.idempotency_key in self.ledger:
+            # Already done, by an execution that may have died before saying so.
+            return self.ledger[ctx.idempotency_key]
+
+        # Annotated because JsonValue's members are invariant: an inferred dict[str, str]
+        # is not a dict[str, JsonValue].
+        effect: NodeOutput = {"node_id": ctx.node_id, "key": ctx.idempotency_key}
+        self.ledger[ctx.idempotency_key] = effect
+        self.commits += 1
+        return effect
 
 
 class HangingAgent:

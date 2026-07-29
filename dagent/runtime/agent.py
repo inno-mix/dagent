@@ -46,6 +46,27 @@ class AgentContext:
     a clear error rather than a crash inside agent code.
     """
 
+    @property
+    def idempotency_key(self) -> str:
+        """A stable name for *this* unit of work, for deduplicating side effects.
+
+        ``(run_id, node_id, attempt)``, rendered as a string so it drops straight into
+        whatever the outside world uses for the job — a payment provider's idempotency
+        header, a unique index, an object key.
+
+        The guarantee that makes it useful: an interrupted node re-dispatched by
+        :meth:`~dagent.runtime.executor.Executor.resume` re-runs under the *same* attempt
+        number, and therefore the same key. A crash cannot tell you whether the side
+        effect landed before the process died, so the engine assumes it might have and
+        hands back a key the outside world can recognise. A retry after a *definite*
+        failure is a different matter and gets a new attempt, because that work provably
+        did not complete.
+
+        This is DR-4 in one line: re-execution is made safe first, which is what leaves
+        resume with nothing to do but reload.
+        """
+        return f"{self.run_id}:{self.node_id}:{self.attempt}"
+
 
 class Agent(Protocol):
     """The single method every agent implements.

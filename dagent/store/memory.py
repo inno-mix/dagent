@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from dagent.errors import StoreError
 from dagent.models.model_call import ModelCallRecord
 from dagent.models.state import NodeOutput, NodeStateRecord, RunStateRecord
+from dagent.models.workflow import Workflow
 
 __all__ = ["InMemoryStateStore"]
 
@@ -26,12 +27,17 @@ class InMemoryStateStore:
     def __init__(self) -> None:
         """Start empty."""
         self._runs: dict[str, RunStateRecord] = {}
+        self._workflows: dict[str, Workflow] = {}
         self._outputs: dict[tuple[str, str], NodeOutput] = {}
-        self._model_calls: dict[str, list[ModelCallRecord]] = {}
+        self._model_calls: dict[str, dict[tuple[str, int, int], ModelCallRecord]] = {}
 
     async def checkpoint(self, run: RunStateRecord) -> None:
         """Write run-level state, replacing the stored record entirely."""
         self._runs[run.run_id] = run
+
+    async def save_workflow(self, run_id: str, workflow: Workflow) -> None:
+        """Write the definition this run is executing."""
+        self._workflows[run_id] = workflow
 
     async def save_node_state(self, record: NodeStateRecord) -> None:
         """Write one node's state into its run."""
@@ -48,6 +54,13 @@ class InMemoryStateStore:
         """Return a run's state."""
         return self._require_run(run_id)
 
+    async def load_workflow(self, run_id: str) -> Workflow:
+        """Return the definition a run is executing."""
+        try:
+            return self._workflows[run_id]
+        except KeyError:
+            raise StoreError(f"run {run_id!r} has no stored workflow") from None
+
     async def load_output(self, run_id: str, node_id: str) -> NodeOutput:
         """Return the output a node produced."""
         try:
@@ -56,14 +69,16 @@ class InMemoryStateStore:
             raise StoreError(f"run {run_id!r} has no output for node {node_id!r}") from None
 
     async def append_model_call(self, record: ModelCallRecord) -> None:
-        """Record one model call made during this run."""
+        """Record one model call, keyed so a repeat of the same call replaces it."""
         self._require_run(record.run_id)
-        self._model_calls.setdefault(record.run_id, []).append(record)
+        calls = self._model_calls.setdefault(record.run_id, {})
+        calls[record.node_id, record.attempt, record.sequence] = record
 
     async def load_model_calls(self, run_id: str) -> Sequence[ModelCallRecord]:
-        """Return every model call made during a run, in the order they were made."""
+        """Return every model call made during a run, ordered by its key."""
         self._require_run(run_id)
-        return tuple(self._model_calls.get(run_id, ()))
+        calls = self._model_calls.get(run_id, {})
+        return tuple(calls[key] for key in sorted(calls))
 
     def _require_run(self, run_id: str) -> RunStateRecord:
         try:

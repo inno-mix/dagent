@@ -4,11 +4,17 @@ The executor is written against this protocol and never against a concrete store
 is what lets v1 run with zero external services and v2 gain durability by swapping the
 implementation rather than rewriting the scheduler (DR-3).
 
-Two ordering rules an implementation may rely on, and the executor guarantees:
+Three ordering rules an implementation may rely on, and the executor guarantees:
 
+* the workflow definition is written before the run record, so a run that exists can
+  always be resumed;
+* run-level state is written before the first node starts;
 * a node's output is written *before* that node is marked ``SUCCESS``, so a node found
-  ``SUCCESS`` on reload always has an output to read;
-* run-level state is written before the first node starts.
+  ``SUCCESS`` on reload always has an output to read.
+
+Together those are what make :meth:`~dagent.runtime.executor.Executor.resume` a *reload*
+rather than a reconstruction: everything needed to continue a run is in here, and the
+executor keeps no state a crash could take with it.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from typing import Protocol, runtime_checkable
 
 from dagent.models.model_call import ModelCallRecord
 from dagent.models.state import NodeOutput, NodeStateRecord, RunStateRecord
+from dagent.models.workflow import Workflow
 
 __all__ = ["StateStore"]
 
@@ -40,6 +47,20 @@ class StateStore(Protocol):
         """
         ...
 
+    async def save_workflow(self, run_id: str, workflow: Workflow) -> None:
+        """Write the definition this run is executing.
+
+        Stored once, at submit time, and separately from the run record rather than inside
+        it: ``checkpoint`` replaces the whole record on every run-level write, and
+        re-serializing an entire graph each time would be a lot of bytes to say "this run
+        is still going".
+
+        Persisting the definition at all is what lets ``resume(run_id)`` take no other
+        argument. Reconstructing it from the original file instead would work today and
+        break in Phase 6, where a planner adds nodes at run time that no file contains.
+        """
+        ...
+
     async def save_node_state(self, record: NodeStateRecord) -> None:
         """Write one node's state, replacing any previous state for that node."""
         ...
@@ -52,6 +73,10 @@ class StateStore(Protocol):
         """Return a run's state, including every node's state."""
         ...
 
+    async def load_workflow(self, run_id: str) -> Workflow:
+        """Return the definition a run is executing."""
+        ...
+
     async def load_output(self, run_id: str, node_id: str) -> NodeOutput:
         """Return the output a node produced.
 
@@ -62,13 +87,22 @@ class StateStore(Protocol):
         ...
 
     async def append_model_call(self, record: ModelCallRecord) -> None:
-        """Record one model call made during this run.
+        """Record one model call, keyed by ``(run_id, node_id, attempt, sequence)``.
 
-        Appends rather than replaces: a node may call a model several times, and every
-        call has to survive for a replay to reproduce the run (FR-8).
+        A node may call a model several times, and every one of them has to survive for a
+        replay to reproduce the run (FR-8) — which is what the ``sequence`` component of
+        the key is for. Recording the *same* key twice replaces rather than duplicates: a
+        node re-executed at the same attempt after a crash replays its own sequence
+        numbers, and two stored answers to one key is a replay that cannot choose.
         """
         ...
 
     async def load_model_calls(self, run_id: str) -> Sequence[ModelCallRecord]:
-        """Return every model call made during a run, in the order they were made."""
+        """Return every model call made during a run, ordered by its key.
+
+        Ordered by ``(node_id, attempt, sequence)`` rather than by wall-clock arrival.
+        Under concurrency there is no single "order they were made" worth reproducing —
+        two nodes interleave differently on every run — whereas ordering by the key is
+        deterministic, identical across implementations, and is what a replay indexes on.
+        """
         ...

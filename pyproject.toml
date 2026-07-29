@@ -11,8 +11,14 @@ dependencies = [
     "pyyaml>=6.0",  # FR-1 workflow files; see the note in ARCHITECTURE.md §2
 ]
 
+[project.optional-dependencies]
+# Postgres is opt-in, not assumed: SPEC's portability requirement is that v1 runs with
+# zero external services, so a store nobody asked for must not be able to break an
+# in-memory run's import. `dagent/store/postgres.py` is the only module that imports it.
+postgres = ["asyncpg>=0.29"]
+
 # Deliberately absent until the phase that calls for them (AGENTS.md §7):
-#   structlog / opentelemetry (Phase 7), asyncpg (Phase 5), redis (Phase 8).
+#   structlog / opentelemetry (Phase 7), redis (Phase 8).
 # No model SDK and no orchestration framework will ever appear here outside `agents/`
 # — tests/test_isolation.py fails the build if one does.
 
@@ -28,6 +34,7 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
     "types-PyYAML>=6.0",
+    "asyncpg>=0.29",  # so the Postgres store is importable in tests
 ]
 
 [build-system]
@@ -72,6 +79,12 @@ python_version = "3.11"
 strict = true
 warn_unreachable = true
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# asyncpg ships no type information. Scoped to the one third-party package rather than
+# loosened globally, and it is not a `type: ignore` on any of our own code.
+module = ["asyncpg.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

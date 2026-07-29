@@ -12,12 +12,17 @@ else, which is what keeps ``runtime`` free to depend on it without an import cyc
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import asynccontextmanager
+from typing import TypeAlias
 
 from dagent.errors import PolicyError
+from dagent.models.model_call import ModelResponse
 
-__all__ = ["Budget", "Limits"]
+__all__ = ["Budget", "Limits", "Pricer", "free"]
+
+Pricer: TypeAlias = Callable[[ModelResponse], float]
+"""Turns a model response into what it cost, in USD."""
 
 
 class Limits:
@@ -121,8 +126,8 @@ class Budget:
 
         Args:
             max_tokens: Total tokens, input plus output, the run may spend.
-            max_cost_usd: Total cost the run may spend. See
-                :data:`~dagent.runtime.metering.free` for why no price table ships here.
+            max_cost_usd: Total cost the run may spend, priced by a :data:`Pricer`.
+                See :func:`free` for why no price table ships with the engine.
 
         Raises:
             PolicyError: If a ceiling is negative.
@@ -219,3 +224,14 @@ def _require_positive(name: str, cap: int | None) -> None:
     """Reject a cap that would stall every node forever."""
     if cap is not None and cap < 1:
         raise PolicyError(f"{name} must be at least 1, got {cap}")
+
+
+def free(response: ModelResponse) -> float:
+    """Price every call at zero — the default :data:`Pricer`.
+
+    No price table ships in this package on purpose. Per-token prices are vendor knowledge
+    that changes without warning, and a stale table baked into an execution engine reports
+    confident, wrong numbers. The token ceiling is exact and needs no table; a run that
+    wants a dollar ceiling supplies the pricing it trusts.
+    """
+    return 0.0

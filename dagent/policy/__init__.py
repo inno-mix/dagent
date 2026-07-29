@@ -10,7 +10,7 @@ Per-node limits (attempts, backoff, timeout) come from the frozen
 failure semantics) come from :class:`RunPolicy` at submit time.
 """
 
-from dagent.policy.limits import Budget, Limits
+from dagent.policy.limits import Budget, Limits, Pricer, free
 from dagent.policy.retry import (
     Backoff,
     Jitter,
@@ -27,9 +27,11 @@ __all__ = [
     "FailureMode",
     "Jitter",
     "Limits",
+    "Pricer",
     "Retryable",
     "RunPolicy",
     "default_retryable",
+    "free",
     "full_jitter",
     "no_jitter",
 ]

@@ -62,6 +62,13 @@ class SpyStore:
         self.events.append(("run", run.run_id, run.state))
         await self.inner.checkpoint(run)
 
+    async def save_workflow(self, run_id: str, workflow: Workflow) -> None:
+        self.events.append(("workflow", run_id, workflow.name))
+        await self.inner.save_workflow(run_id, workflow)
+
+    async def load_workflow(self, run_id: str) -> Workflow:
+        return await self.inner.load_workflow(run_id)
+
     async def save_node_state(self, record):  # type: ignore[no-untyped-def]
         self.events.append(("state", record.node_id, record.state))
         await self.inner.save_node_state(record)
@@ -240,12 +247,14 @@ async def test_a_nodes_output_is_written_before_it_is_marked_success() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_run_is_recorded_before_any_node_starts() -> None:
+async def test_the_definition_is_stored_before_the_run_that_executes_it() -> None:
+    # A run record without a definition behind it is a run `resume` cannot continue.
     store = SpyStore()
 
     await Executor(registry=registry_with(fake=FakeAgent), store=store).run(diamond(), run_id="r1")
 
-    assert store.events[0] == ("run", "r1", RunState.RUNNING)
+    assert store.events[0] == ("workflow", "r1", "diamond")
+    assert store.events[1] == ("run", "r1", RunState.RUNNING)
 
 
 @pytest.mark.asyncio
