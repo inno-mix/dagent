@@ -5,7 +5,7 @@ import pytest
 from dagent.errors import ValidationError
 from dagent.graph.expansion import expand_workflow, validate_expansion
 from dagent.models.expansion import NodeDefinition
-from dagent.models.workflow import Node, Workflow
+from dagent.models.workflow import Workflow
 
 
 class TestExpandWorkflow:
@@ -44,28 +44,24 @@ class TestExpandWorkflow:
         """expand_workflow should reject new nodes with names that collide with existing."""
         new_nodes = [NodeDefinition(name="a", agent="fake")]  # 'a' already exists
 
-        with pytest.raises(ValidationError, match="already exists|collision|duplicate"):
+        with pytest.raises(ValidationError, match=r"already exists|collision|duplicate"):
             expand_workflow(diamond, new_nodes, known_agents={"fake"})
 
     def test_expand_workflow_rejects_unknown_agent(self, diamond: Workflow) -> None:
         """expand_workflow should reject new nodes with unregistered agents."""
         new_nodes = [NodeDefinition(name="e", agent="unknown")]
 
-        with pytest.raises(ValidationError, match="not registered|unknown"):
+        with pytest.raises(ValidationError, match=r"not registered|unknown"):
             expand_workflow(diamond, new_nodes, known_agents={"fake"})
 
     def test_expand_workflow_calls_validate(self, diamond: Workflow) -> None:
         """expand_workflow should validate the augmented graph."""
-        new_nodes = [
-            NodeDefinition(name="e", agent="fake", inputs={"x": "ghost"})
-        ]
+        new_nodes = [NodeDefinition(name="e", agent="fake", inputs={"x": "ghost"})]
 
-        with pytest.raises(ValidationError, match="ghost|not in this workflow"):
+        with pytest.raises(ValidationError, match=r"ghost|not in this workflow"):
             expand_workflow(diamond, new_nodes, known_agents={"fake"})
 
-    def test_expand_workflow_rejects_cycle_in_augmented_graph(
-        self, diamond: Workflow
-    ) -> None:
+    def test_expand_workflow_rejects_cycle_in_augmented_graph(self, diamond: Workflow) -> None:
         """expand_workflow should reject cycles introduced by new nodes."""
         # Try to create a cycle: d depends on new node e, which depends on d
         new_nodes = [
@@ -105,9 +101,7 @@ class TestExpandWorkflow:
         assert expanded.nodes == diamond.nodes
         assert len(expanded.nodes) == 4
 
-    def test_expand_workflow_adds_depends_on_edge_for_inputs(
-        self, diamond: Workflow
-    ) -> None:
+    def test_expand_workflow_adds_depends_on_edge_for_inputs(self, diamond: Workflow) -> None:
         """expand_workflow should add depends_on edges for all referenced inputs."""
         new_nodes = [
             NodeDefinition(
@@ -126,9 +120,7 @@ class TestExpandWorkflow:
 class TestValidateExpansion:
     """Test the pre-expansion validation guard."""
 
-    def test_validate_expansion_accepts_valid_expansion(
-        self, diamond: Workflow
-    ) -> None:
+    def test_validate_expansion_accepts_valid_expansion(self, diamond: Workflow) -> None:
         """validate_expansion should accept valid expansions."""
         new_nodes = [
             NodeDefinition(
@@ -148,13 +140,11 @@ class TestValidateExpansion:
             known_agents={"fake"},
         )
 
-    def test_validate_expansion_rejects_depth_exceeded(
-        self, diamond: Workflow
-    ) -> None:
+    def test_validate_expansion_rejects_depth_exceeded(self, diamond: Workflow) -> None:
         """validate_expansion should reject when expansion_count >= max_depth."""
         new_nodes = [NodeDefinition(name="e", agent="fake")]
 
-        with pytest.raises(ValidationError, match="depth|exceeded|max_depth"):
+        with pytest.raises(ValidationError, match=r"depth|exceeded|max_depth"):
             validate_expansion(
                 diamond,
                 new_nodes,
@@ -175,7 +165,7 @@ class TestValidateExpansion:
             ),
         ]
 
-        with pytest.raises(ValidationError, match="strand|SUCCESS|already"):
+        with pytest.raises(ValidationError, match=r"strand|SUCCESS|already"):
             validate_expansion(
                 diamond,
                 new_nodes,
@@ -185,9 +175,7 @@ class TestValidateExpansion:
                 known_agents={"fake"},
             )
 
-    def test_validate_expansion_allows_depending_on_running_nodes(
-        self, diamond: Workflow
-    ) -> None:
+    def test_validate_expansion_allows_depending_on_running_nodes(self, diamond: Workflow) -> None:
         """validate_expansion should allow new nodes to depend on running nodes."""
         new_nodes = [
             NodeDefinition(
@@ -230,7 +218,7 @@ class TestValidateExpansion:
         """validate_expansion should reject unknown agents."""
         new_nodes = [NodeDefinition(name="e", agent="unknown")]
 
-        with pytest.raises(ValidationError, match="not registered|unknown"):
+        with pytest.raises(ValidationError, match=r"not registered|unknown"):
             validate_expansion(
                 diamond,
                 new_nodes,
@@ -252,7 +240,7 @@ class TestValidateExpansion:
             ),
         ]
 
-        with pytest.raises(ValidationError, match="ghost|not in workflow|does not exist"):
+        with pytest.raises(ValidationError, match=r"ghost|not in workflow|does not exist"):
             validate_expansion(
                 diamond,
                 new_nodes,
@@ -262,9 +250,7 @@ class TestValidateExpansion:
                 known_agents={"fake"},
             )
 
-    def test_validate_expansion_respects_max_depth_boundary(
-        self, diamond: Workflow
-    ) -> None:
+    def test_validate_expansion_respects_max_depth_boundary(self, diamond: Workflow) -> None:
         """validate_expansion should allow expansion_count < max_depth."""
         new_nodes = [NodeDefinition(name="e", agent="fake")]
 
@@ -278,9 +264,7 @@ class TestValidateExpansion:
             known_agents={"fake"},
         )
 
-    def test_validate_expansion_rejects_at_max_depth(
-        self, diamond: Workflow
-    ) -> None:
+    def test_validate_expansion_rejects_at_max_depth(self, diamond: Workflow) -> None:
         """validate_expansion should reject when expansion_count == max_depth."""
         new_nodes = [NodeDefinition(name="e", agent="fake")]
 
@@ -294,9 +278,7 @@ class TestValidateExpansion:
                 known_agents={"fake"},
             )
 
-    def test_validate_expansion_multiple_inputs_strand_prevention(
-        self, diamond: Workflow
-    ) -> None:
+    def test_validate_expansion_multiple_inputs_strand_prevention(self, diamond: Workflow) -> None:
         """validate_expansion should reject if ANY input is to a SUCCESS node."""
         new_nodes = [
             NodeDefinition(
@@ -306,7 +288,7 @@ class TestValidateExpansion:
             ),
         ]
 
-        with pytest.raises(ValidationError, match="strand|SUCCESS"):
+        with pytest.raises(ValidationError, match=r"strand|SUCCESS"):
             validate_expansion(
                 diamond,
                 new_nodes,
@@ -316,9 +298,7 @@ class TestValidateExpansion:
                 known_agents={"fake"},
             )
 
-    def test_validate_expansion_with_params_no_validation_error(
-        self, diamond: Workflow
-    ) -> None:
+    def test_validate_expansion_with_params_no_validation_error(self, diamond: Workflow) -> None:
         """validate_expansion should handle params without validation errors."""
         new_nodes = [
             NodeDefinition(

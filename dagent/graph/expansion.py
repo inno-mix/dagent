@@ -13,10 +13,9 @@ from __future__ import annotations
 from collections.abc import Collection
 
 from dagent.errors import ValidationError
-from dagent.graph.topo import descendants, nodes_by_id
 from dagent.graph.validate import validate
 from dagent.models.expansion import NodeDefinition
-from dagent.models.workflow import Node, NodeId, Workflow
+from dagent.models.workflow import Node, Workflow
 
 __all__ = ["expand_workflow", "validate_expansion"]
 
@@ -69,7 +68,7 @@ def expand_workflow(
         # depends_on = all nodes referenced in inputs
         depends_on = tuple(sorted(set(node_def.inputs.values())))
         node = Node(
-            id=node_def.name,  # type: ignore
+            id=node_def.name,
             agent=node_def.agent,
             depends_on=depends_on,
             inputs=node_def.inputs,
@@ -118,9 +117,7 @@ def validate_expansion(
     """
     # Check 1: Expansion depth
     if expansion_count >= max_depth:
-        raise ValidationError(
-            f"expansion depth limit exceeded: {expansion_count} >= {max_depth}"
-        )
+        raise ValidationError(f"expansion depth limit exceeded: {expansion_count} >= {max_depth}")
 
     # Build sets for validation
     existing_ids = frozenset(node.id for node in workflow.nodes)

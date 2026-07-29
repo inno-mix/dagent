@@ -7,8 +7,6 @@ broader design principle that definitions never mutate.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from dagent.models.workflow import Policy
@@ -50,7 +48,7 @@ class NodeDefinition(BaseModel):
     threshold, or other configuration.
     """
 
-    policy: Optional[Policy] = None
+    policy: Policy | None = None
     """Node-level retry and timeout policy override.
 
     If None, the node inherits the workflow's default policy. If set, this policy

@@ -1,6 +1,7 @@
 """Tests for node expansion schema used by planner agents."""
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 
 from dagent.models.expansion import ExpansionResult, NodeDefinition
 from dagent.models.workflow import Policy
@@ -69,7 +70,7 @@ class TestNodeDefinition:
             inputs={},
             params={},
         )
-        with pytest.raises(Exception):  # Pydantic raises ValidationError on frozen model
+        with pytest.raises(PydanticValidationError):
             node.name = "changed"  # type: ignore[misc]
 
     def test_node_definition_serialization(self) -> None:
@@ -163,17 +164,17 @@ class TestExpansionResult:
         assert result.max_depth == 1000
 
         # Invalid: too low
-        with pytest.raises(Exception):  # Pydantic ValidationError
+        with pytest.raises(PydanticValidationError):
             ExpansionResult(nodes=[], max_depth=0)
 
         # Invalid: too high
-        with pytest.raises(Exception):  # Pydantic ValidationError
+        with pytest.raises(PydanticValidationError):
             ExpansionResult(nodes=[], max_depth=1001)
 
     def test_expansion_result_is_frozen(self) -> None:
         """ExpansionResult is immutable (frozen)."""
         result = ExpansionResult(nodes=[])
-        with pytest.raises(Exception):  # Pydantic raises ValidationError on frozen model
+        with pytest.raises(PydanticValidationError):
             result.max_depth = 200  # type: ignore[misc]
 
     def test_expansion_result_serialization(self) -> None:
