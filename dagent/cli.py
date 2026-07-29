@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, TypeAlias
 
 import typer
+from pydantic import ValidationError as PydanticValidationError
 
 import dagent.agents  # noqa: F401  — imported for the side effect of registering agents
 from dagent import __version__
@@ -22,7 +23,9 @@ from dagent.errors import DagentError, PolicyError, StoreError
 from dagent.graph.validate import validate as validate_graph
 from dagent.loader import load_workflow_file
 from dagent.models.state import NodeState, NodeStateRecord, RunState, RunStateRecord
-from dagent.models.workflow import Workflow
+from dagent.models.workflow import Policy, Workflow
+from dagent.observability import logging as obs_logging
+from dagent.observability.inspector import inspect_run
 from dagent.policy.limits import Budget, Limits
 from dagent.policy.run import FailureMode, RunPolicy
 from dagent.runtime.executor import Executor
@@ -48,6 +51,48 @@ def main() -> None:
     Without this, Typer collapses a single-command app into a bare entrypoint, and
     ``dagent version`` would stop working the moment a second command is added.
     """
+
+
+@app.command()
+def inspect(
+    run_id: Annotated[str, typer.Argument(help="Identifier of the run to dump.")],
+    store: Annotated[
+        str, typer.Option(help=f"State store: 'postgres' via ${POSTGRES_DSN_ENV}, or 'memory'.")
+    ] = "postgres",
+    outputs: Annotated[bool, typer.Option(help="Include each node's output.")] = True,
+    indent: Annotated[int, typer.Option(help="JSON indent; 0 for one line.")] = 2,
+) -> None:
+    """Dump everything the store knows about a run, as JSON (FR-10).
+
+    Node states, attempt counts, timings, errors, the definition as actually executed —
+    expanded, if a planner grew it — every recorded model call, and each node's output.
+    Enough to reconstruct what happened without the process that ran it.
+
+    Defaults to the Postgres store, because a run worth inspecting is usually one that has
+    already finished in some other process.
+    """
+    code = asyncio.run(_inspect(run_id, store=store, outputs=outputs, indent=indent))
+    raise typer.Exit(code)
+
+
+async def _inspect(run_id: str, *, store: str, outputs: bool, indent: int) -> int:
+    """Assemble the report and print it, or explain why not."""
+    try:
+        state_store = await _open_store(store)
+    except DagentError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        return 2
+
+    try:
+        report = await inspect_run(state_store, run_id, outputs=outputs)
+    except DagentError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        return 2
+    finally:
+        await _aclose(state_store)
+
+    typer.echo(json.dumps(report, indent=indent or None, ensure_ascii=False, default=str))
+    return 0
 
 
 @app.command()
@@ -94,6 +139,19 @@ def run(
     store: Annotated[
         str, typer.Option(help=f"State store: 'memory', or 'postgres' via ${POSTGRES_DSN_ENV}.")
     ] = "memory",
+    max_attempts: Annotated[
+        int, typer.Option(help="Attempts for nodes that declare no policy of their own.")
+    ] = 1,
+    node_timeout: Annotated[
+        float | None,
+        typer.Option(help="Timeout in seconds for nodes that declare no policy."),
+    ] = None,
+    log_level: Annotated[
+        str, typer.Option(help="Structured log level: debug, info, warning, error, or 'off'.")
+    ] = "off",
+    json_logs: Annotated[
+        bool, typer.Option(help="Render logs as JSON rather than for a human.")
+    ] = False,
 ) -> None:
     """Run a workflow end to end and report what each node did.
 
@@ -104,6 +162,7 @@ def run(
     The options here are per run: they are how much of the machine, and of the budget,
     this particular execution is allowed to use.
     """
+    _logging(log_level, json_logs)
     workflow = _load(workflow_file)
     try:
         policy = _run_policy(
@@ -111,6 +170,8 @@ def run(
             provider_concurrency=provider_concurrency,
             max_tokens=max_tokens,
             on_failure=on_failure,
+            max_attempts=max_attempts,
+            node_timeout=node_timeout,
         )
     except DagentError as exc:
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
@@ -152,6 +213,19 @@ def resume(
     store: Annotated[
         str, typer.Option(help=f"State store: 'postgres' via ${POSTGRES_DSN_ENV}, or 'memory'.")
     ] = "postgres",
+    max_attempts: Annotated[
+        int, typer.Option(help="Attempts for nodes that declare no policy of their own.")
+    ] = 1,
+    node_timeout: Annotated[
+        float | None,
+        typer.Option(help="Timeout in seconds for nodes that declare no policy."),
+    ] = None,
+    log_level: Annotated[
+        str, typer.Option(help="Structured log level: debug, info, warning, error, or 'off'.")
+    ] = "off",
+    json_logs: Annotated[
+        bool, typer.Option(help="Render logs as JSON rather than for a human.")
+    ] = False,
 ) -> None:
     """Continue a run that was interrupted, from wherever it got to.
 
@@ -165,12 +239,15 @@ def resume(
     under the same idempotency key they were already using, so an agent that deduplicates
     on ``ctx.idempotency_key`` commits its effect exactly once across the crash.
     """
+    _logging(log_level, json_logs)
     try:
         policy = _run_policy(
             max_concurrency=max_concurrency,
             provider_concurrency=provider_concurrency,
             max_tokens=max_tokens,
             on_failure=on_failure,
+            max_attempts=max_attempts,
+            node_timeout=node_timeout,
         )
     except DagentError as exc:
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
@@ -189,14 +266,33 @@ def resume(
     raise typer.Exit(code)
 
 
+def _logging(level: str, json_logs: bool) -> None:
+    """Turn structured logging on, unless the caller asked for none.
+
+    Off by default: the report this CLI already prints is what a person wants, and a run
+    that also narrates every state transition is a run whose output nobody reads. Anyone
+    who needs the narration asks for it.
+    """
+    if level.lower() == "off":
+        return
+    obs_logging.configure(level=level.upper(), json=json_logs)
+
+
 def _run_policy(
     *,
     max_concurrency: int | None,
     provider_concurrency: int | None,
     max_tokens: int | None,
     on_failure: str,
+    max_attempts: int = 1,
+    node_timeout: float | None = None,
 ) -> RunPolicy:
     """Assemble the run-level policy from the command line.
+
+    ``max_attempts`` and ``node_timeout`` become the defaults for nodes that declare no
+    policy — which includes every node a planner generates at run time, since a generated
+    node has no file to have written one in. Without this the dynamic workflow was
+    strictly less robust than the hand-written one, which a live 503 demonstrated.
 
     Raises:
         PolicyError: If a cap is out of range or the failure mode is not one of the three.
@@ -207,8 +303,14 @@ def _run_policy(
         modes = ", ".join(mode.value for mode in FailureMode)
         raise PolicyError(f"unknown failure mode {on_failure!r}; expected one of {modes}") from exc
 
+    try:
+        defaults = Policy(max_attempts=max_attempts, timeout_s=node_timeout)
+    except PydanticValidationError as exc:
+        raise PolicyError(f"invalid node defaults: {exc}") from exc
+
     return RunPolicy(
         failure_mode=failure_mode,
+        node_defaults=defaults,
         limits=Limits(
             max_concurrency=max_concurrency,
             default_per_provider=provider_concurrency,

@@ -9,6 +9,12 @@ dependencies = [
     "typer>=0.12",
     "httpx>=0.27",  # AGENTS.md §4: the HTTP client for provider calls (Phase 3)
     "pyyaml>=6.0",  # FR-1 workflow files; see the note in ARCHITECTURE.md §2
+    # Observability (Phase 7). The *API* only: OpenTelemetry's API is a no-op until an
+    # application installs an SDK, so a library depending on it costs a nearly-free
+    # function call and forces nothing on anyone. The SDK and the exporters are the
+    # `otel` extra, which is the split OTel itself prescribes for libraries.
+    "opentelemetry-api>=1.25",
+    "structlog>=24.1",
 ]
 
 [project.optional-dependencies]
@@ -16,9 +22,13 @@ dependencies = [
 # zero external services, so a store nobody asked for must not be able to break an
 # in-memory run's import. `dagent/store/postgres.py` is the only module that imports it.
 postgres = ["asyncpg>=0.29"]
+# Turns the no-op tracer and meter into real ones and exposes a Prometheus endpoint.
+otel = [
+    "opentelemetry-sdk>=1.25",
+    "opentelemetry-exporter-prometheus>=0.46b0",
+]
 
-# Deliberately absent until the phase that calls for them (AGENTS.md §7):
-#   structlog / opentelemetry (Phase 7), redis (Phase 8).
+# Deliberately absent until the phase that calls for them (AGENTS.md §7): redis (Phase 8).
 # No model SDK and no orchestration framework will ever appear here outside `agents/`
 # — tests/test_isolation.py fails the build if one does.
 
@@ -35,6 +45,8 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML>=6.0",
     "asyncpg>=0.29",  # so the Postgres store is importable in tests
+    "opentelemetry-sdk>=1.25",  # in-memory span and metric readers for the tests
+    "opentelemetry-exporter-prometheus>=0.46b0",
 ]
 
 [build-system]

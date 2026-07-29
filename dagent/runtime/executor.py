@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from datetime import datetime
+from typing import Any
 
 from dagent.errors import StoreError, ValidationError
 from dagent.graph.topo import descendants, nodes_by_id, ready_set
@@ -27,6 +28,9 @@ from dagent.models.state import (
     RunStateRecord,
 )
 from dagent.models.workflow import Node, Policy, Workflow
+from dagent.observability import logging as obs_logging
+from dagent.observability import metrics as obs_metrics
+from dagent.observability import tracing
 from dagent.policy.run import FailureMode, RunPolicy
 from dagent.runtime.agent import AgentContext
 from dagent.runtime.clock import Clock, SystemClock
@@ -83,6 +87,10 @@ class Executor:
         self._clock: Clock = clock if clock is not None else SystemClock()
         self._model: ModelClient = model if model is not None else NullModelClient()
         self._policy = policy if policy is not None else RunPolicy()
+        # Built once: instrument creation is not free, and the loop records on every
+        # node transition. Observability never feeds back into a run's outcome, which
+        # is why this one dependency is resolved rather than injected — see DR-11.
+        self._metrics = obs_metrics.metrics_for()
 
     async def run(self, workflow: Workflow, *, run_id: str) -> RunStateRecord:
         """Execute every node in the workflow and return the final run state.
@@ -199,55 +207,16 @@ class Executor:
         expansion needs no state backfill and no second scheduling path.
         """
         in_flight: dict[asyncio.Task[NodeState], str] = {}
-        halted = False
+        started = self._clock.now()
+        log = obs_logging.get_logger()
         try:
-            while True:
-                workflow = graph.workflow
-                nodes = nodes_by_id(workflow)
-                # Declaration order, so a batch of completions is folded in the same
-                # sequence every time — see the comment where `declared` is used below.
-                declared = {node_id: index for index, node_id in enumerate(nodes)}
-
-                if not halted:
-                    for node_id in ready_set(workflow, states):
-                        # Mark READY before dispatching: ready_set only offers PENDING
-                        # nodes, so this is what stops the next pass re-dispatching one.
-                        states[node_id] = NodeState.READY
-                        await self._record(
-                            run_id, node_id, NodeState.READY, attempt=attempts.get(node_id, 0)
-                        )
-                        task = asyncio.create_task(
-                            self._execute(
-                                run_id,
-                                nodes[node_id],
-                                graph=graph,
-                                first_attempt=attempts.get(node_id, 0),
-                            ),
-                            name=f"dagent:{run_id}:{node_id}",
-                        )
-                        in_flight[task] = node_id
-
-                # Nothing running and nothing ready: the graph can make no more progress.
-                # With a failed node that leaves its dependents PENDING — see _close_run.
-                if not in_flight:
-                    break
-
-                done, _ = await asyncio.wait(set(in_flight), return_when=asyncio.FIRST_COMPLETED)
-                # `asyncio.wait` hands back a *set*, and several nodes can land in the
-                # same batch. Folding them in set order would make the record depend on
-                # hash iteration — two identical runs could then attribute a skipped node
-                # to different upstream failures. Declaration order restores rule 4.
-                failures: list[str] = []
-                for task in sorted(done, key=lambda finished: declared[in_flight[finished]]):
-                    node_id = in_flight.pop(task)
-                    states[node_id] = task.result()
-                    if states[node_id] is NodeState.FAILED:
-                        failures.append(node_id)
-
-                for node_id in failures:
-                    halted |= await self._apply_failure_mode(
-                        run_id, graph.workflow, node_id, states, in_flight
-                    )
+            with (
+                obs_logging.bind_run(run_id, graph.workflow.name),
+                tracing.run_span(run_id, graph.workflow.name) as span,
+            ):
+                log.info("run.started", nodes=len(graph.workflow.nodes))
+                state = await self._loop(run_id, graph, states, attempts, in_flight, log)
+                span.set_attribute(tracing.RUN_STATE, state.value)
         except asyncio.CancelledError:
             # The caller walked away: stop every node, then say so in the record rather
             # than leaving a run that looks like it is still going.
@@ -258,7 +227,80 @@ class Executor:
             await self._cancel(in_flight)
             raise
 
-        return await self._checkpoint(run_id, self._derive_run_state(graph.workflow, states))
+        self._metrics.run_duration.record(
+            (self._clock.now() - started).total_seconds(),
+            {obs_metrics.WORKFLOW: graph.workflow.name, obs_metrics.STATE: state.value},
+        )
+        log.info("run.finished", state=state.value, nodes=len(graph.workflow.nodes))
+        return await self._checkpoint(run_id, state)
+
+    async def _loop(
+        self,
+        run_id: str,
+        graph: RunGraph,
+        states: dict[str, NodeState],
+        attempts: Mapping[str, int],
+        in_flight: dict[asyncio.Task[NodeState], str],
+        log: Any,
+    ) -> RunState:
+        """Drive the ready set until no further progress is possible.
+
+        Split out from :meth:`_drive` so the run span and the log binding wrap it as one
+        block rather than being threaded through the loop body. Cancellation handling
+        stays outside, where it can still checkpoint after the context managers unwind.
+        """
+        halted = False
+        while True:
+            workflow = graph.workflow
+            nodes = nodes_by_id(workflow)
+            # Declaration order, so a batch of completions is folded in the same
+            # sequence every time — see the comment where `declared` is used below.
+            declared = {node_id: index for index, node_id in enumerate(nodes)}
+
+            ready = () if halted else ready_set(workflow, states)
+            self._metrics.ready_set_size.record(len(ready), {obs_metrics.WORKFLOW: workflow.name})
+            for node_id in ready:
+                # Mark READY before dispatching: ready_set only offers PENDING
+                # nodes, so this is what stops the next pass re-dispatching one.
+                states[node_id] = NodeState.READY
+                await self._record(
+                    run_id, node_id, NodeState.READY, attempt=attempts.get(node_id, 0)
+                )
+                task = asyncio.create_task(
+                    self._execute(
+                        run_id,
+                        nodes[node_id],
+                        graph=graph,
+                        first_attempt=attempts.get(node_id, 0),
+                    ),
+                    name=f"dagent:{run_id}:{node_id}",
+                )
+                in_flight[task] = node_id
+
+            # Nothing running and nothing ready: the graph can make no more progress.
+            # With a failed node that leaves its dependents PENDING — see _close_run.
+            if not in_flight:
+                break
+
+            done, _ = await asyncio.wait(set(in_flight), return_when=asyncio.FIRST_COMPLETED)
+            # `asyncio.wait` hands back a *set*, and several nodes can land in the
+            # same batch. Folding them in set order would make the record depend on
+            # hash iteration — two identical runs could then attribute a skipped node
+            # to different upstream failures. Declaration order restores rule 4.
+            failures: list[str] = []
+            for task in sorted(done, key=lambda finished: declared[in_flight[finished]]):
+                node_id = in_flight.pop(task)
+                states[node_id] = task.result()
+                if states[node_id] is NodeState.FAILED:
+                    failures.append(node_id)
+
+            for node_id in failures:
+                log.warning("node.failed", node_id=node_id)
+                halted |= await self._apply_failure_mode(
+                    run_id, graph.workflow, node_id, states, in_flight
+                )
+
+        return self._derive_run_state(graph.workflow, states)
 
     # --- one node -------------------------------------------------------------------
 
@@ -282,58 +324,97 @@ class Executor:
         policy = self._policy.policy_for(node.policy)
         started = self._clock.now()
         attempt = first_attempt
+        provider = self._model.provider
+        labels = {obs_metrics.AGENT: node.agent, obs_metrics.PROVIDER: provider}
+        log = obs_logging.get_logger()
 
         while True:
-            await self._record(
-                run_id, node.id, NodeState.RUNNING, attempt=attempt, started_at=started
-            )
-            try:
-                output = await self._attempt(
-                    run_id, node, attempt=attempt, policy=policy, graph=graph
+            # The whole attempt — dispatch, outcome, and the line that reports it — sits
+            # inside one binding. The success log used to fall outside it and arrived with
+            # no node_id, which is the one field FR-9 asks these lines to carry.
+            with obs_logging.bind_node(node.id, node.agent, attempt):
+                await self._record(
+                    run_id, node.id, NodeState.RUNNING, attempt=attempt, started_at=started
                 )
-            except Exception as exc:
-                # A failing agent is an ordinary outcome, recorded and folded back into
-                # the loop. CancelledError is not an Exception, so a cancelled node — and
-                # therefore a timed-out one, once its timeout has converted it — still
-                # propagates rather than being mistaken for a failure to retry.
-                if attempt + 1 >= policy.max_attempts or not self._policy.retryable(exc):
-                    await self._record(
-                        run_id,
-                        node.id,
-                        NodeState.FAILED,
-                        attempt=attempt,
-                        started_at=started,
-                        finished_at=self._clock.now(),
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                    return NodeState.FAILED
+                if attempt > first_attempt:
+                    self._metrics.retries.add(1, labels)
+                try:
+                    with tracing.node_span(run_id, node.id, node.agent, attempt) as span:
+                        span.set_attribute(tracing.PROVIDER, provider)
+                        self._metrics.nodes_in_flight.add(1, labels)
+                        self._metrics.provider_in_flight.add(1, {obs_metrics.PROVIDER: provider})
+                        try:
+                            output = await self._attempt(
+                                run_id,
+                                node,
+                                attempt=attempt,
+                                policy=policy,
+                                graph=graph,
+                                span=span,
+                            )
+                        finally:
+                            self._metrics.nodes_in_flight.add(-1, labels)
+                            self._metrics.provider_in_flight.add(
+                                -1, {obs_metrics.PROVIDER: provider}
+                            )
+                except Exception as exc:
+                    # A failing agent is an ordinary outcome, recorded and folded back into
+                    # the loop. CancelledError is not an Exception, so a cancelled node —
+                    # and therefore a timed-out one, once its timeout has converted it —
+                    # still propagates rather than being mistaken for a failure to retry.
+                    log.warning("node.attempt_failed", error=f"{type(exc).__name__}: {exc}")
+                    if attempt + 1 >= policy.max_attempts or not self._policy.retryable(exc):
+                        self._metrics.nodes_completed.add(
+                            1, {**labels, obs_metrics.STATE: NodeState.FAILED.value}
+                        )
+                        await self._record(
+                            run_id,
+                            node.id,
+                            NodeState.FAILED,
+                            attempt=attempt,
+                            started_at=started,
+                            finished_at=self._clock.now(),
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                        return NodeState.FAILED
 
-                # Deliberately no FAILED write between attempts. FAILED is terminal, and a
-                # terminal state a node then leaves is a lie — Phase 5's resume reads these
-                # records to decide what still needs doing. The rising `attempt` on the
-                # RUNNING record is the visible evidence that a retry happened.
-                await self._clock.sleep(self._policy.backoff.delay(policy, attempt))
-                attempt += 1
-                continue
+                    # Deliberately no FAILED write between attempts. FAILED is terminal,
+                    # and a terminal state a node then leaves is a lie — Phase 5's resume
+                    # reads these records to decide what still needs doing. The rising
+                    # `attempt` on the RUNNING record is the evidence that a retry happened.
+                    await self._clock.sleep(self._policy.backoff.delay(policy, attempt))
+                    attempt += 1
+                    continue
 
-            # Output first, then SUCCESS: a node found SUCCESS must always have an output
-            # to read, or Phase 5's resume would skip a node whose result it cannot
-            # recover. The expansion lands before both, so a graph that grew is durable
-            # before anything says the node that grew it is done — a crash in between
-            # re-runs the planner, whose replayed expansion is then a no-op.
-            await self._store.append_output(run_id, node.id, output)
-            await self._record(
-                run_id,
-                node.id,
-                NodeState.SUCCESS,
-                attempt=attempt,
-                started_at=started,
-                finished_at=self._clock.now(),
-            )
-            return NodeState.SUCCESS
+                # Output first, then SUCCESS: a node found SUCCESS must always have an
+                # output to read, or Phase 5's resume would skip a node whose result it
+                # cannot recover. The expansion lands before both, so a graph that grew is
+                # durable before anything says the node that grew it is done — a crash in
+                # between re-runs the planner, whose replayed expansion is then a no-op.
+                await self._store.append_output(run_id, node.id, output)
+                await self._record(
+                    run_id,
+                    node.id,
+                    NodeState.SUCCESS,
+                    attempt=attempt,
+                    started_at=started,
+                    finished_at=self._clock.now(),
+                )
+                self._metrics.nodes_completed.add(
+                    1, {**labels, obs_metrics.STATE: NodeState.SUCCESS.value}
+                )
+                log.info("node.succeeded", attempt=attempt)
+                return NodeState.SUCCESS
 
     async def _attempt(
-        self, run_id: str, node: Node, *, attempt: int, policy: Policy, graph: RunGraph
+        self,
+        run_id: str,
+        node: Node,
+        *,
+        attempt: int,
+        policy: Policy,
+        graph: RunGraph,
+        span: tracing.Span,
     ) -> NodeOutput:
         """Run the agent once, under this attempt's permits and timeout.
 
@@ -346,6 +427,7 @@ class Executor:
         agent = self._registry.create(node.agent)
         inputs = await self._resolve_inputs(run_id, node)
         expansion = Expansion()
+        before = (self._policy.budget.tokens_used, self._policy.budget.cost_used)
         context = AgentContext(
             run_id=run_id,
             node_id=node.id,
@@ -382,6 +464,7 @@ class Executor:
             output = await agent.run(context)
 
         await self._apply_expansion(run_id, node.id, graph, expansion)
+        self._record_usage(span, before)
         return output
 
     async def _apply_expansion(
@@ -406,6 +489,24 @@ class Executor:
         await self._store.save_workflow(run_id, graph.workflow)
         for new in added:
             await self._record(run_id, new.id, NodeState.PENDING)
+
+    def _record_usage(self, span: tracing.Span, before: tuple[int, float]) -> None:
+        """Attribute this attempt's model spend to its span and to the counters.
+
+        Measured as the budget's movement rather than by inspecting the response, because
+        the budget is the one place every call is already metered — and a node that made
+        three calls should report the total, not the last one.
+        """
+        tokens = self._policy.budget.tokens_used - before[0]
+        cost = self._policy.budget.cost_used - before[1]
+        if not tokens and not cost:
+            return
+
+        provider = {obs_metrics.PROVIDER: self._model.provider}
+        span.set_attribute(tracing.OUTPUT_TOKENS, tokens)
+        self._metrics.tokens.add(tokens, provider)
+        if cost:
+            self._metrics.cost.add(cost, provider)
 
     async def _resolve_inputs(self, run_id: str, node: Node) -> Mapping[str, NodeOutput]:
         """Read this node's declared inputs out of its upstream nodes' stored outputs.

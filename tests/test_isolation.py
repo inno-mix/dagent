@@ -211,7 +211,13 @@ ALLOWED_DEPENDENCIES = {
     "graph": frozenset({"errors", "models", "graph"}),
     "policy": frozenset({"errors", "models", "policy"}),
     "store": frozenset({"errors", "models", "store"}),
-    "runtime": frozenset({"errors", "models", "graph", "policy", "store", "runtime"}),
+    # `observability` sits above `store` — the run inspector reads one — and below
+    # `runtime`, which emits through it. Signals only ever travel one way: nothing here
+    # can change what a run does, which is why the executor may depend on it at all.
+    "observability": frozenset({"errors", "models", "store", "observability"}),
+    "runtime": frozenset(
+        {"errors", "models", "graph", "policy", "store", "observability", "runtime"}
+    ),
 }
 
 LAYERED_FILES = [
@@ -249,13 +255,24 @@ def test_the_layering_scan_actually_covers_files() -> None:
 
 OPTIONAL_DEPENDENCIES = {
     "asyncpg": "dagent/store/postgres.py",
+    # OpenTelemetry's *API* is a base dependency and does nothing on its own; the SDK and
+    # the exporters are the `otel` extra. Only `setup.py` may reach for them, and only
+    # when called — which is what lets every other module emit signals unconditionally.
+    "opentelemetry.sdk": "dagent/observability/setup.py",
+    "opentelemetry.exporter": "dagent/observability/setup.py",
+    "prometheus_client": "dagent/observability/setup.py",
 }
 """Packages that are extras, and the one module allowed to import each.
 
 `asyncpg` ships under `dagent[postgres]`. If any other module imports it — the CLI
 naming the store in a help string, say — then a plain `pip install dagent` produces a
 package that cannot be imported at all, and SPEC's "v1 runs with zero external services"
-becomes false in the most embarrassing way possible.
+becomes false in the most embarrassing way possible. The same reasoning covers the
+OpenTelemetry SDK: an engine that always emits spans must not require the machinery that
+collects them.
+
+Matched on dotted prefixes, so `opentelemetry.api` stays allowed everywhere while
+`opentelemetry.sdk` does not.
 """
 
 
@@ -267,31 +284,39 @@ def test_an_optional_dependency_is_imported_only_where_it_is_allowed(
     offenders = sorted(
         module
         for module in _imported_modules(path)
-        if (owner := OPTIONAL_DEPENDENCIES.get(module.split(".")[0])) is not None
-        and owner != relative
+        if (owner := _optional_owner(module)) is not None and owner != relative
     )
 
     assert not offenders, (
         f"{relative} imports the optional dependency {offenders}. Only "
-        f"{[OPTIONAL_DEPENDENCIES[m.split('.')[0]] for m in offenders]} may, or the base "
-        "install stops importing."
+        f"{sorted({_optional_owner(m) for m in offenders})} may, or the base install "
+        "stops importing."
     )
+
+
+def _optional_owner(module: str) -> str | None:
+    """The module allowed to import this one, if it is an extra."""
+    parts = module.split(".")
+    for depth in range(len(parts), 0, -1):
+        owner = OPTIONAL_DEPENDENCIES.get(".".join(parts[:depth]))
+        if owner is not None:
+            return owner
+    return None
 
 
 def test_no_optional_dependency_is_declared_in_the_base_install() -> None:
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     base = {_requirement_name(requirement) for requirement in data["project"]["dependencies"]}
 
-    assert not base & set(OPTIONAL_DEPENDENCIES), "an extra leaked into the base install"
+    leaked = {name for name in base if _optional_owner(name.replace("-", ".")) is not None}
+    assert not leaked, f"an extra leaked into the base install: {sorted(leaked)}"
 
 
-def test_each_optional_dependency_has_an_extra_that_provides_it() -> None:
-    # An "optional" dependency nobody can install is just a missing one.
+def test_the_opentelemetry_api_is_a_base_dependency() -> None:
+    # The half of the split that makes the other half safe: without the API in the base
+    # install, every module that emits a span would need the extra after all.
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    extras = {
-        _requirement_name(requirement)
-        for group in data["project"].get("optional-dependencies", {}).values()
-        for requirement in group
-    }
+    base = {_requirement_name(requirement) for requirement in data["project"]["dependencies"]}
 
-    assert set(OPTIONAL_DEPENDENCIES) <= extras
+    assert "opentelemetry-api" in base
+    assert "opentelemetry-sdk" not in base

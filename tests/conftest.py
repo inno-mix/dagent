@@ -9,10 +9,13 @@ Postgres needs a live database, which a unit test suite must not require. Set
 is skipped with a reason, so nobody mistakes "not run" for "passed".
 """
 
+import logging
 import os
+from collections.abc import Iterator
 
 import pytest
 import pytest_asyncio
+import structlog
 
 from dagent.store.memory import InMemoryStateStore
 
@@ -49,3 +52,18 @@ async def store(request: pytest.FixtureRequest):  # type: ignore[no-untyped-def]
         yield postgres
     finally:
         await postgres.close()
+
+
+@pytest.fixture(autouse=True)
+def isolate_logging() -> Iterator[None]:
+    """Keep one test's logging configuration out of the next test's output.
+
+    ``structlog.configure`` and ``logging.basicConfig`` are both process-global, which is
+    correct for an application and awkward for a suite: a test that turns logging on would
+    otherwise make the next test's "this should be quiet" assertion pass or fail depending
+    on collection order. Resetting afterwards is what keeps those assertions about the
+    code rather than about alphabetical luck.
+    """
+    yield
+    structlog.reset_defaults()
+    logging.getLogger().handlers.clear()

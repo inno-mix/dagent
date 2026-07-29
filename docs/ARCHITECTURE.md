@@ -235,8 +235,37 @@ minimum needed to satisfy FR-1's "loadable from YAML", it is used only through
 to this one module.
 
 ### Observability (`dagent/observability`)
-OpenTelemetry setup, metric definitions, and `structlog` configuration. Executor and
-policy emit spans/metrics through here; nothing here knows about specific agents.
+Write-only, in both senses: nothing here can change what a run does, and nothing here
+knows about a specific agent. That is what makes it safe for the executor to depend on.
+
+- `tracing.py` — one span per run, one per **node attempt**, nested. Per attempt rather
+  than per node because three tries took three different times for three different
+  reasons, and averaging them into one span discards the thing you opened the trace to
+  find. Nesting comes free from `contextvars`: `asyncio.create_task` copies the current
+  context, so a node task spawned inside the run span sees it as its parent with nothing
+  threaded through.
+- `metrics.py` — the six numbers FR-9 names. The instrument choice is the interesting
+  part: in-flight counts are `UpDownCounter` (they go both ways, only the current value
+  means anything), ready-set size is a `Histogram` (its *distribution* is the backpressure
+  story), retries and tokens are `Counter` (they only accumulate). Attributes are
+  deliberately low-cardinality — never a run id or node id, because one time series per
+  run is how a metrics backend falls over. Per-run detail is the trace's job.
+- `logging.py` — `structlog`, correlated through context variables rather than arguments,
+  so a line written deep inside an agent carries its `run_id` and `node_id` without every
+  function in between growing a parameter. Silent until configured: unconfigured
+  `structlog` prints to stdout at every level, which for a library is an import that
+  starts spraying into somebody's terminal and into the CLI's own report.
+- `inspector.py` — FR-10's run inspector. Computes nothing the engine did not already
+  record, which is the point: **if the inspector can rebuild a run, the store held enough
+  to resume it.** Reports the definition *as executed*, so a graph a planner grew is
+  legible even though no file describes it.
+- `setup.py` — the only module that touches the OpenTelemetry SDK, and only when called.
+
+**The API/SDK split.** dagent depends on `opentelemetry-api`, which is a no-op until an
+application installs an SDK; the SDK and the Prometheus exporter are the `otel` extra.
+That is the split OTel prescribes for libraries, and it is why the engine can emit spans
+and metrics unconditionally while costing a caller who wants none almost exactly nothing.
+`tests/test_isolation.py` enforces it: only `setup.py` may import `opentelemetry.sdk`.
 
 ## 3. Execution model
 
@@ -445,3 +474,15 @@ chooses* and must replay identically, while a timeout is a *deadline imposed on 
 duration the engine does not control*. Also why the timeout starts *inside* the concurrency
 permits rather than outside them — queueing for a slot is contention, not the node's own
 latency, and a node that never got to run has not overrun anything.
+
+**DR-11: Observability is resolved globally, not injected — the one exception to DR-5.**
+Every other source of non-determinism reaches the engine through a constructor parameter,
+because it can change what a run produces. A tracer cannot: spans, metrics and logs are
+write-only, and a run whose exporter fails returns exactly what it would have returned
+anyway. So the executor calls `get_tracer`/`get_meter` rather than taking them as
+arguments, which is OpenTelemetry's own idiom and keeps a signal nobody has to thread
+through six call sites from appearing in the signature of everything that emits one.
+The seam still exists — it is OTel's global provider — and tests use it. *Rejected:*
+injecting a tracer and a meter (four more constructor parameters that no test wants to
+set, defending against a class of bug that cannot occur), and skipping observability in
+core code (which is where all the interesting timing is).

@@ -1,3 +1,4 @@
+import contextlib
 import pathlib
 
 import pytest
@@ -9,6 +10,7 @@ from dagent.errors import ValidationError
 from dagent.runtime.executor import Executor
 from dagent.runtime.model import StubModelClient
 from dagent.store import POSTGRES_DSN_ENV
+from dagent.store.memory import InMemoryStateStore
 
 runner = CliRunner()
 
@@ -268,3 +270,140 @@ def test_resume_rejects_an_unknown_failure_mode_before_touching_the_store() -> N
 
     assert result.exit_code == 2
     assert "unknown failure mode" in result.output
+
+
+# --- Phase 7: the run inspector -------------------------------------------------------
+
+
+def test_inspect_needs_a_run_id() -> None:
+    result = runner.invoke(app, ["inspect"])
+
+    assert result.exit_code == 2
+
+
+def test_inspect_reports_a_run_that_is_not_there() -> None:
+    result = runner.invoke(app, ["inspect", "never-happened", "--store", "memory"])
+
+    assert result.exit_code == 2
+    assert "unknown run" in result.output
+
+
+def test_inspect_appears_in_the_help() -> None:
+    result = runner.invoke(app, ["--help"])
+
+    assert "inspect" in result.output
+
+
+def test_inspect_reports_a_postgres_dsn_it_was_not_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(POSTGRES_DSN_ENV, raising=False)
+
+    result = runner.invoke(app, ["inspect", "r1"])
+
+    assert result.exit_code == 2
+    assert POSTGRES_DSN_ENV in result.output
+
+
+def test_run_can_narrate_itself() -> None:
+    result = runner.invoke(
+        app, ["run", EXAMPLE, "--provider", "stub", "--log-level", "info", "--no-show-outputs"]
+    )
+
+    assert result.exit_code == 0
+    assert "run.started" in result.output
+
+
+def test_run_says_nothing_extra_by_default() -> None:
+    # The report is what a person wants; a run that also narrates every transition is a
+    # run whose output nobody reads.
+    result = runner.invoke(app, ["run", EXAMPLE, "--provider", "stub", "--no-show-outputs"])
+
+    assert "run.started" not in result.output
+
+
+def test_run_can_emit_json_logs() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            EXAMPLE,
+            "--provider",
+            "stub",
+            "--log-level",
+            "info",
+            "--json-logs",
+            "--no-show-outputs",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert '"event": "run.started"' in result.output
+
+
+def test_inspect_prints_the_report_as_json() -> None:
+    # A run and its inspection are normally two processes sharing Postgres. Here the
+    # store is handed to both, so the JSON rendering and the exit code are exercised
+    # without needing a database for what is really a formatting question.
+    import json as json_module
+
+    store = InMemoryStateStore()
+
+    with _using_store(store):
+        ran = runner.invoke(
+            app,
+            ["run", EXAMPLE, "--provider", "stub", "--run-id", "insp", "--no-show-outputs"],
+        )
+        assert ran.exit_code == 0
+        result = runner.invoke(app, ["inspect", "insp", "--store", "memory"])
+
+    assert result.exit_code == 0
+    report = json_module.loads(result.output)
+    assert report["run"]["run_id"] == "insp"
+    assert report["run"]["state"] == "succeeded"
+    assert [node["node_id"] for node in report["nodes"]] == sorted(
+        node["node_id"] for node in report["nodes"]
+    )
+    assert report["model_calls"]
+
+
+@contextlib.contextmanager
+def _using_store(store: InMemoryStateStore):  # type: ignore[no-untyped-def]
+    """Make every CLI command in this block share one store, as Postgres would."""
+
+    async def _fixed(kind: str) -> InMemoryStateStore:
+        return store
+
+    original = cli._open_store
+    cli._open_store = _fixed  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        cli._open_store = original  # type: ignore[assignment]
+
+
+def test_node_defaults_reach_nodes_that_declare_no_policy() -> None:
+    # Surfaced by a live 503: a planner-generated node has no file to declare a policy in,
+    # so it inherits the run's defaults — which were inert and unreachable from the CLI.
+    result = runner.invoke(
+        app,
+        ["run", EXAMPLE, "--provider", "stub", "--max-attempts", "3", "--no-show-outputs"],
+    )
+
+    assert result.exit_code == 0
+
+
+def test_an_impossible_node_default_is_refused_before_the_run_starts() -> None:
+    result = runner.invoke(app, ["run", EXAMPLE, "--provider", "stub", "--max-attempts", "0"])
+
+    assert result.exit_code == 2
+    assert "invalid node defaults" in result.output
+
+
+def test_a_node_timeout_default_is_accepted() -> None:
+    result = runner.invoke(
+        app,
+        ["run", EXAMPLE, "--provider", "stub", "--node-timeout", "30", "--no-show-outputs"],
+    )
+
+    assert result.exit_code == 0

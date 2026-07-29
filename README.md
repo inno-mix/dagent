@@ -48,8 +48,8 @@ Under construction, phase by phase, against [`docs/ROADMAP.md`](docs/ROADMAP.md)
 | 4 — Policy engine | Retries, timeouts, budgets, failure semantics | Done |
 | 5 — Persistence + crash resume | Kill it mid-run, restart, get the same result | Done |
 | 6 — Dynamic DAG expansion | A planner agent grows the graph at runtime | Done |
-| 7 — Observability + run inspector | Tracing, metrics, and a CLI `inspect` command | Next |
-| 8 — Capstone: distributed workers | Same core, Redis Streams transport, Postgres store | Planned |
+| 7 — Observability + run inspector | Tracing, metrics, and a CLI `inspect` command | Done |
+| 8 — Capstone: distributed workers | Same core, Redis Streams transport, Postgres store | Next |
 
 ## Architecture at a glance
 
