@@ -442,7 +442,11 @@ class Executor:
             # Sorted so the record is written in the same order on every run, which is
             # what keeps two runs of the same failure byte-comparable.
             for node_id in sorted(descendants(workflow, failed)):
-                if states.get(node_id) is not NodeState.PENDING:
+                # Absent means PENDING, the same rule `ready_set` and `_derive_run_state`
+                # use. A node an expansion added is not in `states` until it is dispatched,
+                # and reading a missing entry as "not pending" quietly excluded exactly the
+                # nodes a grown graph most needs marking.
+                if states.get(node_id, NodeState.PENDING) is not NodeState.PENDING:
                     continue
                 states[node_id] = NodeState.SKIPPED
                 await self._record(
