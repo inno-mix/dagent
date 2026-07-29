@@ -19,10 +19,11 @@ PACKAGES = [
     "runtime",
     "policy",
     "store",
+    "transport",
     "agents",
     "observability",
 ]
-MODULES = ["errors", "cli"]
+MODULES = ["errors", "loader", "cli"]
 
 
 @pytest.mark.parametrize("package", PACKAGES)
@@ -44,5 +45,5 @@ def test_package_ships_type_information() -> None:
 
 def test_tests_mirror_the_package_layout() -> None:
     tests_root = pathlib.Path(__file__).parent
-    for package in ("models", "graph", "runtime", "store", "agents"):
+    for package in ("models", "graph", "runtime", "store", "transport", "agents"):
         assert (tests_root / package).is_dir(), f"tests/{package}/ should mirror dagent/{package}/"

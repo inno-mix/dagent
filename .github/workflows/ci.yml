@@ -11,6 +11,38 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+
+    # The Postgres store and the Redis transport are skipped locally unless a developer has
+    # them running, which means CI is the one place they are never skipped. A conformance
+    # suite that only ever runs against the in-memory implementation proves half of what it
+    # claims, and the half it proves is the half that cannot break in production.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: dagent
+          POSTGRES_DB: dagent
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DAGENT_TEST_POSTGRES_DSN: postgresql://postgres:dagent@localhost:5432/dagent
+      DAGENT_TEST_REDIS_URL: redis://localhost:6379/0
+
     steps:
       - uses: actions/checkout@v4
 
@@ -33,3 +65,14 @@ jobs:
 
       - name: Tests
         run: uv run pytest
+
+      - name: No test was skipped for want of infrastructure
+        # Both services are up, so every store and transport parametrisation must have run.
+        # Without this, a typo in a DSN would turn the whole integration half of the suite
+        # into a silent skip and CI would still be green.
+        run: |
+          uv run pytest -q -rs 2>&1 | tee /tmp/pytest.out
+          if grep -qE "SKIPPED .*(POSTGRES_DSN|REDIS_URL) is not set" /tmp/pytest.out; then
+            echo "::error::a service-backed test was skipped; check the DSN/URL env vars"
+            exit 1
+          fi

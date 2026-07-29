@@ -8,6 +8,7 @@ Skipped wholesale without `DAGENT_TEST_POSTGRES_DSN`, so nobody mistakes "not ru
 "passed".
 """
 
+import asyncio
 import os
 
 import pytest
@@ -48,6 +49,26 @@ async def test_connect_creates_the_schema_and_satisfies_the_protocol() -> None:
         await store.create_schema()
     finally:
         await store.close()
+
+
+@needs_postgres
+@pytest.mark.asyncio
+async def test_several_processes_can_open_the_store_at_once() -> None:
+    # Phase 8 made this reachable and it was not safe. `CREATE TABLE IF NOT EXISTS` looks
+    # like a concurrency guarantee and is not: two connections that both find a table
+    # missing both try to create it, and the loser gets a unique-violation from Postgres'
+    # own catalogue. A pool of workers coming up together hits it on the first run, which is
+    # exactly how it was found — never in a single-process test.
+    assert DSN is not None
+    async with asyncio.TaskGroup() as opening:
+        opened = [opening.create_task(PostgresStateStore.connect(DSN)) for _ in range(8)]
+
+    stores = [task.result() for task in opened]
+    try:
+        assert all(isinstance(store, StateStore) for store in stores)
+    finally:
+        for store in stores:
+            await store.close()
 
 
 @needs_postgres

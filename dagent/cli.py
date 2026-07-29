@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import pathlib
+import socket
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, TypeAlias
 
@@ -19,7 +20,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 import dagent.agents  # noqa: F401  — imported for the side effect of registering agents
 from dagent import __version__
-from dagent.errors import DagentError, PolicyError, StoreError
+from dagent.errors import DagentError, PolicyError, StoreError, TransportError
 from dagent.graph.validate import validate as validate_graph
 from dagent.loader import load_workflow_file
 from dagent.models.state import NodeState, NodeStateRecord, RunState, RunStateRecord
@@ -28,12 +29,16 @@ from dagent.observability import logging as obs_logging
 from dagent.observability.inspector import inspect_run
 from dagent.policy.limits import Budget, Limits
 from dagent.policy.run import FailureMode, RunPolicy
+from dagent.runtime.dispatch import Dispatcher, QueueDispatcher
 from dagent.runtime.executor import Executor
 from dagent.runtime.model import ModelClient, NullModelClient, StubModelClient
 from dagent.runtime.registry import default_registry
+from dagent.runtime.worker import Worker
 from dagent.store import POSTGRES_DSN_ENV
 from dagent.store.base import StateStore
 from dagent.store.memory import InMemoryStateStore
+from dagent.transport import REDIS_URL_ENV
+from dagent.transport.base import WorkQueue
 
 app = typer.Typer(
     name="dagent",
@@ -139,6 +144,10 @@ def run(
     store: Annotated[
         str, typer.Option(help=f"State store: 'memory', or 'postgres' via ${POSTGRES_DSN_ENV}.")
     ] = "memory",
+    queue: Annotated[
+        str,
+        typer.Option(help=f"Work queue: 'none' to run here, or 'redis' via ${REDIS_URL_ENV}."),
+    ] = "none",
     max_attempts: Annotated[
         int, typer.Option(help="Attempts for nodes that declare no policy of their own.")
     ] = 1,
@@ -161,6 +170,11 @@ def run(
     Retries and timeouts are per node and come from the workflow file's ``policy`` block.
     The options here are per run: they are how much of the machine, and of the budget,
     this particular execution is allowed to use.
+
+    With ``--queue redis`` this process becomes a *coordinator*: it validates, schedules,
+    owns the graph, and hands each ready node to a ``dagent worker`` instead of running it
+    here. Workers need the same ``--store`` and ``--queue``, and a store both processes can
+    see — which rules out ``memory``.
     """
     _logging(log_level, json_logs)
     workflow = _load(workflow_file)
@@ -183,6 +197,7 @@ def run(
             run_id=run_id,
             provider=provider,
             store=store,
+            queue=queue,
             show_outputs=show_outputs,
             policy=policy,
         )
@@ -213,6 +228,10 @@ def resume(
     store: Annotated[
         str, typer.Option(help=f"State store: 'postgres' via ${POSTGRES_DSN_ENV}, or 'memory'.")
     ] = "postgres",
+    queue: Annotated[
+        str,
+        typer.Option(help=f"Work queue: 'none' to run here, or 'redis' via ${REDIS_URL_ENV}."),
+    ] = "none",
     max_attempts: Annotated[
         int, typer.Option(help="Attempts for nodes that declare no policy of their own.")
     ] = 1,
@@ -259,11 +278,158 @@ def resume(
             run_id=run_id,
             provider=provider,
             store=store,
+            queue=queue,
             show_outputs=show_outputs,
             policy=policy,
         )
     )
     raise typer.Exit(code)
+
+
+@app.command()
+def worker(
+    name: Annotated[
+        str, typer.Option(help="This worker's identity in the pool. Must be unique.")
+    ] = "",
+    provider: Annotated[
+        str, typer.Option(help="Model provider: 'gemini', 'stub' for a dry run, or 'none'.")
+    ] = "gemini",
+    store: Annotated[
+        str, typer.Option(help=f"State store: 'postgres' via ${POSTGRES_DSN_ENV}, or 'memory'.")
+    ] = "postgres",
+    queue: Annotated[
+        str, typer.Option(help=f"Work queue: 'redis' via ${REDIS_URL_ENV}.")
+    ] = "redis",
+    max_concurrency: Annotated[
+        int | None, typer.Option(help="Cap on nodes this worker runs at once.")
+    ] = None,
+    provider_concurrency: Annotated[
+        int | None, typer.Option(help="Cap on nodes per provider, for this worker.")
+    ] = None,
+    max_attempts: Annotated[
+        int, typer.Option(help="Attempts for nodes that declare no policy of their own.")
+    ] = 1,
+    node_timeout: Annotated[
+        float | None,
+        typer.Option(help="Timeout in seconds for nodes that declare no policy."),
+    ] = None,
+    reclaim_after: Annotated[
+        float,
+        typer.Option(help="Seconds a claimed node may go unreported before it is taken over."),
+    ] = 30.0,
+    poll: Annotated[float, typer.Option(help="Seconds to wait for work before looping.")] = 1.0,
+    limit: Annotated[
+        int | None, typer.Option(help="Exit after running this many nodes. Default: never.")
+    ] = None,
+    log_level: Annotated[
+        str, typer.Option(help="Structured log level: debug, info, warning, error, or 'off'.")
+    ] = "off",
+    json_logs: Annotated[
+        bool, typer.Option(help="Render logs as JSON rather than for a human.")
+    ] = False,
+) -> None:
+    """Run nodes handed out by a coordinator, until stopped (Phase 8).
+
+    Start as many of these as you like; they are interchangeable and none of them is in
+    charge. Each takes a node off the queue, runs its agent, writes the result through the
+    store, and reports back. Nothing about which node comes next is decided here — that is
+    the coordinator's job, and it is the same scheduler a single-process run uses.
+
+    Kill one mid-node and its work is not lost: the node it claimed goes unacknowledged,
+    another worker takes it over after ``--reclaim-after``, and it re-runs under the same
+    idempotency key. That is the whole reason Phase 5 made re-execution safe first.
+
+    Point it at the same ``--store`` and ``--queue`` as the coordinator. ``--store memory``
+    cannot work here, because the point of a worker is that it is a different process.
+    """
+    _logging(log_level, json_logs)
+    try:
+        policy = _run_policy(
+            max_concurrency=max_concurrency,
+            provider_concurrency=provider_concurrency,
+            max_tokens=None,
+            on_failure=FailureMode.RUN_TO_COMPLETION.value,
+            max_attempts=max_attempts,
+            node_timeout=node_timeout,
+        )
+    except DagentError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2) from exc
+
+    code = asyncio.run(
+        _work(
+            name=name or f"{socket.gethostname()}-{os.getpid()}",
+            provider=provider,
+            store=store,
+            queue=queue,
+            policy=policy,
+            reclaim_after=reclaim_after,
+            poll=poll,
+            limit=limit,
+        )
+    )
+    raise typer.Exit(code)
+
+
+async def _work(
+    *,
+    name: str,
+    provider: str,
+    store: str,
+    queue: str,
+    policy: RunPolicy,
+    reclaim_after: float,
+    poll: float,
+    limit: int | None,
+) -> int:
+    """Consume work until interrupted, and report how much this worker did."""
+    # The queue first, and before any connection is opened: it is the one dependency that
+    # defines this command, and a misspelled flag should not cost a round trip to Postgres
+    # and a look for a provider key before it is reported.
+    try:
+        work_queue = await _open_queue(queue)
+    except DagentError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        return 2
+
+    if work_queue is None:
+        typer.secho(
+            "error: a worker needs a queue; pass --queue redis", fg=typer.colors.RED, err=True
+        )
+        return 2
+
+    try:
+        state_store = await _open_store(store)
+        client = _model_client(provider)
+    except DagentError as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        await _aclose(work_queue)
+        return 2
+
+    typer.echo(f"worker {name}: waiting for work (ctrl-c to stop)")
+    handled = 0
+    try:
+        handled = await Worker(
+            name=name,
+            registry=default_registry,
+            store=state_store,
+            queue=work_queue,
+            model=client,
+            policy=policy,
+            claim_timeout_s=poll,
+            reclaim_after_s=reclaim_after,
+        ).run_forever(limit=limit)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # An orderly stop, not a failure. The node in flight, if any, was cancelled and
+        # left unacknowledged, so another worker will pick it up.
+        typer.echo("")
+    finally:
+        await _aclose(client)
+        await _aclose(work_queue)
+        await _aclose(state_store)
+
+    typer.echo(f"worker {name}: ran {handled} node(s)")
+    return 0
 
 
 def _logging(level: str, json_logs: bool) -> None:
@@ -391,6 +557,28 @@ async def _open_store(kind: str) -> StateStore:
     raise StoreError(f"unknown store {kind!r}; expected 'memory' or 'postgres'")
 
 
+async def _open_queue(kind: str) -> WorkQueue | None:
+    """Open the work transport, or ``None`` for a run that dispatches to itself.
+
+    Raises:
+        DagentError: If the kind is unknown, or Redis was asked for without a URL.
+    """
+    if kind == "none":
+        return None
+    if kind == "redis":
+        url = os.environ.get(REDIS_URL_ENV)
+        if not url:
+            raise TransportError(
+                f"{REDIS_URL_ENV} is not set; export a Redis URL, or pass --queue none to run "
+                "every node in this process"
+            )
+        # Imported here so `dagent` stays usable with the `redis` extra uninstalled.
+        from dagent.transport.redis import RedisWorkQueue
+
+        return await RedisWorkQueue.connect(url)
+    raise TransportError(f"unknown queue {kind!r}; expected 'none' or 'redis'")
+
+
 async def _drive(
     drive: Drive,
     *,
@@ -399,24 +587,34 @@ async def _drive(
     store: str,
     show_outputs: bool,
     policy: RunPolicy,
+    queue: str = "none",
 ) -> int:
     """Execute or resume, print a report, and return the process exit code."""
     try:
         state_store = await _open_store(store)
         client = _model_client(provider)
+        work_queue = await _open_queue(queue)
     except DagentError as exc:
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
         return 2
 
+    dispatcher: Dispatcher | None = None if work_queue is None else QueueDispatcher(work_queue)
     try:
         result = await drive(
-            Executor(registry=default_registry, store=state_store, model=client, policy=policy)
+            Executor(
+                registry=default_registry,
+                store=state_store,
+                model=client,
+                policy=policy,
+                dispatcher=dispatcher,
+            )
         )
     except DagentError as exc:
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
         return 2
     finally:
         await _aclose(client)
+        await _aclose(work_queue)
 
     try:
         return await _report(state_store, result, policy=policy, show_outputs=show_outputs)
@@ -425,7 +623,9 @@ async def _drive(
 
 
 async def _aclose(resource: object) -> None:
-    """Close a client or store that has something to close."""
+    """Close a client, store, or queue that has something to close."""
+    if resource is None:
+        return
     for name in ("aclose", "close"):
         closer = getattr(resource, name, None)
         if closer is not None:

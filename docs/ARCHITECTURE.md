@@ -34,6 +34,10 @@ Everything the executor does is a loop: compute ready set → acquire permits �
 dispatch → on completion persist state and recompute ready set → repeat until the
 graph is terminal.
 
+That is the default, single-process shape. The distributed one differs at exactly one
+place — the arrow from the executor to the agents becomes a work queue and a pool of worker
+processes — and nothing else in the diagram moves. See §6 and DR-12.
+
 ## 2. Components
 
 ### Models (`dagent/models`)
@@ -126,11 +130,27 @@ No async, no I/O — trivially unit- and property-testable, and enforced by
   includes the first. No lock, no queue, and no window in which the graph is half-expanded.
   `tests/runtime/test_run_graph.py` asserts the absence of `await` by AST, because a stray
   one would reintroduce that window silently.
-- `executor.py` — the scheduler. Owns the run loop, the ready-set recomputation, the
-  concurrency permits, the handoff to the policy layer, and `resume`. A fresh run and a
-  resumed one share one loop: `run` seeds it with every node `PENDING`, `resume` seeds it
-  from the store. A resume that went down a second code path would be a second set of
-  scheduling bugs, and the claim of DR-4 is precisely that resume is *not* special.
+- `node.py` — `NodeRunner`, which drives one node to a verdict: its attempts, its timeout,
+  the permits it holds, the budget it spends, the model calls it records, and the order its
+  state is written in. Knows nothing about graphs. Until Phase 8 this was a private method
+  on the executor, which meant "run a node" was only reachable through "schedule a graph"
+  and a second process had no way in that did not drag a scheduler with it. Splitting it
+  changed no behaviour and is what lets `worker.py` exist with no duplicated policy layer.
+  Also defines `ExpansionSink`, the one genuinely new seam — see DR-12.
+- `dispatch.py` — the `Dispatcher` protocol and its two implementations. `LocalDispatcher`
+  runs nodes as tasks on the coordinator's own loop, which is what the executor did inline
+  before there was a choice; `QueueDispatcher` posts them to a `WorkQueue` and waits for
+  other processes to answer. `MergingExpansion` lives here too: the sink for a node running
+  on the loop that owns the graph.
+- `worker.py` — the stateless worker loop: claim, look the node up in the store, run it,
+  publish the result, acknowledge. Holds no run state and no graph. Reclaims stale pending
+  entries when it is idle, which is the only way a dead worker's node ever runs again.
+- `executor.py` — the scheduler, and in v2 the coordinator. Owns the run loop, the ready-set
+  recomputation, the failure semantics, the graph, and `resume`. A fresh run and a resumed
+  one share one loop: `run` seeds it with every node `PENDING`, `resume` seeds it from the
+  store. A resume that went down a second code path would be a second set of scheduling
+  bugs, and the claim of DR-4 is precisely that resume is *not* special. Likewise a
+  distributed run: it is this same loop with a different dispatcher (DR-12).
   This is the heart of the project; keep it under tight test. `run_id` is supplied by
   the caller rather than minted here, so no run depends on an id it cannot reproduce.
 
@@ -205,6 +225,36 @@ one table with no foreign key back to `dagent_run`, because a foreign key would 
 parent row first and invert the guarantee. Of the two torn writes available — a definition
 with no run, or a run with no definition — the first is an orphan row and the second is a
 run nobody can continue.
+
+Schema creation is serialized on a Postgres advisory lock. `CREATE TABLE IF NOT EXISTS`
+reads as a concurrency guarantee and is not one: two connections that both find a table
+missing will both attempt it, and the loser gets a unique-violation from `pg_type` rather
+than a polite no-op. That was unreachable while exactly one process ever connected, and it
+fired on the first real two-worker run in Phase 8, where a pool opens the store all at once.
+
+### Transport (`dagent/transport`)
+`WorkQueue` `Protocol`: `follow`, `submit`, `collect`, `settle` for the coordinator;
+`claim`, `reclaim`, `complete` for a worker. Two impls: `memory.py` (asyncio, no services)
+and `redis.py` (Redis Streams and consumer groups, behind the `redis` extra). Held to one
+contract by `tests/transport/test_queue_conformance.py`, for the same reason the two stores
+are: "the transport is swappable" is only worth claiming if two of them actually agree.
+
+Two channels, deliberately asymmetric. **Work** is one stream shared by every run, consumed
+by a group of interchangeable workers, so any worker can run any node. **Results** are one
+stream *per run*, read only by that run's coordinator — there is exactly one coordinator per
+run, because it is the thing that owns the graph, so a shared results channel would mean
+every coordinator filtering out everyone else's traffic.
+
+Both are at-least-once, and a message is acknowledged only once the work it describes has
+been *dealt with* rather than on receipt. On the work channel that means a worker that dies
+mid-node leaves an entry another worker can reclaim. On the results channel it means a
+coordinator that dies holding an unmerged expansion is told about it again. Streams rather
+than lists: `BRPOP` hands a message over and forgets it, so a dead consumer takes the work
+with it and there is nothing left to redeliver.
+
+This package sits beside `store`, not above it: a work queue that could reach the state
+store would be a second writer of run state, which is exactly what DR-12 is arranged to
+prevent. `tests/test_isolation.py` enforces that arrow.
 
 ### Agents (`dagent/agents`)
 Concrete implementations: `planner`, `researcher`, `synthesizer`, `critic` — plus the
@@ -387,15 +437,48 @@ agent `run(ctx)` executes → output serialized and persisted → state → `SUC
 ready set recomputed. A failure instead flows through retry; exhausted retries set
 `FAILED` and the run's failure semantics decide siblings/downstream.
 
-## 6. Scaling path (v1 → v2)
+## 6. Scaling path (v1 → v2), as executed
 
-v1 is one process. To distribute: replace the in-process task dispatch with a
-**Redis Streams** work queue — the executor becomes a *coordinator* that enqueues
-ready nodes; stateless **workers** consume, run the agent, and write results back
-through the `StateStore` (now Postgres). The ready-set/validation/policy logic is
-unchanged because it was never coupled to the transport. Consumer groups give
-at-least-once delivery, which is safe precisely because node execution is already
-idempotent. This is the whole reason v1 invests in idempotency early.
+v1 was one process. v2 replaces the in-process task dispatch with a **Redis Streams** work
+queue: the executor becomes a *coordinator* that enqueues ready nodes, and stateless
+**workers** consume, run the agent, and write results back through the `StateStore` (now
+Postgres). Consumer groups give at-least-once delivery, which is safe precisely because node
+execution was already idempotent. This is the whole reason v1 invested in idempotency early,
+and it is worth recording what the prediction cost when it came due.
+
+**Held.** `dagent/graph` was not touched — validation, cycle detection, `ready_set`,
+`descendants` and `expand_workflow` are the same pure functions. `dagent/policy` was not
+touched. The three failure modes, the budget, the backoff, the idempotency key, `resume` and
+the run-state derivation are shared code, and there is still exactly one run loop: a
+distributed run and a single-process run go through `Executor._loop` identically. Only the
+`Dispatcher` differs.
+
+**Cost.** One extraction (per-node execution out of the scheduler into `runtime/node.py`),
+one new seam (`Dispatcher`), one new package (`transport`), and one new protocol member that
+the design did not anticipate — `Dispatcher.start` has to hand back the results a previous
+coordinator never acknowledged, because a resumed run has nothing outstanding and would
+otherwise conclude on its first pass that it was finished, dropping an unmerged expansion.
+That was a real bug, caught by a test written from the acceptance criterion rather than from
+the code.
+
+**Genuinely harder.** Three things, none of them hidden. Expansion cannot be merged by the
+worker that requested it (DR-12). `fail_fast` cannot cancel a coroutine in another process,
+so it drains instead and reports what the siblings actually did. And a *token ceiling* is now
+enforced per worker rather than per run, because nothing sums spending across processes;
+concurrency caps being per worker is the desirable half of the same fact.
+
+## 6a. Data flow for one node, distributed
+
+`ready_set` picks node → coordinator marks it `READY`, persists that, and submits
+`(run_id, node_id, attempt)` → a worker claims it, reads the definition and the upstream
+outputs *from the store*, builds `AgentContext`, and runs it under the same policy wrapper →
+output and terminal state persisted → result published with any expansion the node
+requested → work entry acknowledged → coordinator folds the result in, merges and persists
+any expansion, acknowledges the result, recomputes the ready set.
+
+The message carries the idempotency key and nothing else. Not the node, not its inputs, not
+the workflow: all of that is already in the store, and a message that carried it would be a
+second source of truth that disagrees with the first the moment a planner expands anything.
 
 ## 7. Decision records
 
@@ -486,3 +569,28 @@ The seam still exists — it is OTel's global provider — and tests use it. *Re
 injecting a tracer and a meter (four more constructor parameters that no test wants to
 set, defending against a class of bug that cannot occur), and skipping observability in
 core code (which is where all the interesting timing is).
+
+**DR-12: The transport is a seam, and the graph has exactly one owner.**
+Distribution was added by swapping what happens between "this node is ready" and "here is
+what it did" — a `Dispatcher` protocol with an in-process and a queue-backed implementation —
+rather than by writing a second scheduler. That is DR-1's bet paid off, and §6 records what
+it cost.
+
+The one thing that could not be swapped is *who may change the graph*. Expansion (FR-7) is
+validated against the whole graph, and its atomicity in v1 came from `RunGraph.apply`
+containing no `await`: on one event loop, the absence of a suspension point is the
+serialisation. Across processes there is no such guarantee, and a worker holding a workflow
+it loaded a second ago cannot know whether another worker's planner has grown it since. So
+the graph stays with the coordinator, and a node that wants to grow it hands its request to
+an `ExpansionSink` — which merges in place when the runner is on the owning loop, and merely
+collects when it is not, letting the request ride home on the result.
+
+Two consequences, both deliberate. A rejected expansion still fails only the node that asked
+for it, but the verdict arrives one hop later, from the coordinator. And results are
+acknowledged only *after* they have been merged, never on receipt, so a coordinator that dies
+between reading a planner's completion and persisting the graph it described is told again
+rather than losing the work — which is why `Dispatcher.start` returns the unacknowledged set.
+*Rejected:* a distributed lock around expansion (a second consensus problem to get wrong, to
+serialise something that is already naturally serialised at one point), and letting workers
+merge optimistically and reconciling later (two writers of the definition, and no answer to
+which one is right).

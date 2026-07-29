@@ -14,6 +14,7 @@ __all__ = [
     "DagentError",
     "PolicyError",
     "StoreError",
+    "TransportError",
     "ValidationError",
 ]
 
@@ -69,3 +70,14 @@ class AgentError(DagentError):
 
 class StoreError(DagentError):
     """A ``StateStore`` operation failed."""
+
+
+class TransportError(DagentError):
+    """A ``WorkQueue`` operation failed (Phase 8).
+
+    Separate from :class:`StoreError` because the two failures mean opposite things to an
+    operator. A store failure means the record of the run is in doubt; a transport failure
+    means only that a message did not move, which at-least-once delivery already assumes
+    will happen and already recovers from. Collapsing them would make the recoverable case
+    look like the one that needs a human.
+    """

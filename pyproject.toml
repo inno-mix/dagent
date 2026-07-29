@@ -27,8 +27,11 @@ otel = [
     "opentelemetry-sdk>=1.25",
     "opentelemetry-exporter-prometheus>=0.46b0",
 ]
+# The Phase 8 work transport. Opt-in on the same terms as Postgres: a single-process run
+# reaches for no broker, so a broker must not be able to break its import.
+# `dagent/transport/redis.py` is the only module that imports it.
+redis = ["redis>=5.0"]
 
-# Deliberately absent until the phase that calls for them (AGENTS.md §7): redis (Phase 8).
 # No model SDK and no orchestration framework will ever appear here outside `agents/`
 # — tests/test_isolation.py fails the build if one does.
 
@@ -45,6 +48,7 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML>=6.0",
     "asyncpg>=0.29",  # so the Postgres store is importable in tests
+    "redis>=5.0",  # so the Redis transport is importable in tests
     "opentelemetry-sdk>=1.25",  # in-memory span and metric readers for the tests
     "opentelemetry-exporter-prometheus>=0.46b0",
 ]

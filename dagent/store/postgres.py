@@ -32,6 +32,15 @@ from dagent.store import POSTGRES_DSN_ENV
 
 __all__ = ["PostgresStateStore"]
 
+_SCHEMA_LOCK = 0x6461_6765  # "dage"
+"""The advisory-lock key schema creation serializes on.
+
+An arbitrary constant, and it only has to be arbitrary consistently: every dagent process
+uses this one, and nothing else in the database is expected to. Advisory locks live in their
+own namespace and are released when the transaction ends, so a process killed mid-DDL
+releases it rather than wedging the next one.
+"""
+
 DSN_ENV = POSTGRES_DSN_ENV
 """Re-exported so provider-side code can name it without reaching into the package."""
 
@@ -136,8 +145,20 @@ class PostgresStateStore:
         EXISTS` per table is the right amount of machinery for a schema that is five tables
         and has never been versioned. When it needs versioning it will need Alembic, and
         that is a different change.
+
+        Serialized by an advisory lock, because ``IF NOT EXISTS`` is not the concurrency
+        guarantee it looks like: two connections that both find a table missing will both
+        try to create it, and the loser gets a unique-violation on ``pg_type`` rather than a
+        polite no-op. That could not happen while exactly one process ever connected, and it
+        happens immediately in Phase 8, where every worker opens the store on startup and a
+        pool comes up all at once. An advisory lock rather than catching the violation: the
+        error arrives from Postgres' own catalogue and matching on it would be guessing at
+        which of several catalogue constraints tripped.
         """
-        async with self._acquire() as connection:
+        async with self._acquire() as connection, connection.transaction():
+            # Held until the transaction ends, which is what makes the check-then-create
+            # below atomic against another connection doing the same thing.
+            await connection.execute("SELECT pg_advisory_xact_lock($1)", _SCHEMA_LOCK)
             await connection.execute(SCHEMA)
 
     async def close(self) -> None:

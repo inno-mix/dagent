@@ -49,7 +49,106 @@ Under construction, phase by phase, against [`docs/ROADMAP.md`](docs/ROADMAP.md)
 | 5 — Persistence + crash resume | Kill it mid-run, restart, get the same result | Done |
 | 6 — Dynamic DAG expansion | A planner agent grows the graph at runtime | Done |
 | 7 — Observability + run inspector | Tracing, metrics, and a CLI `inspect` command | Done |
-| 8 — Capstone: distributed workers | Same core, Redis Streams transport, Postgres store | Next |
+| 8 — Capstone: distributed workers | Same core, Redis Streams transport, Postgres store | Done |
+
+## Distributed workers — and what did *not* change
+
+The last phase moves execution off the coordinator's event loop and onto a pool of
+interchangeable worker processes, talking over Redis Streams, with Postgres as the shared
+store. The interesting part of that sentence is how little of the engine it touched.
+
+```
+  coordinator process                          worker process  (x N)
+  ┌────────────────────────┐                   ┌────────────────────────┐
+  │ validate               │   dagent:work     │ claim ─┐               │
+  │ ready_set  ────────────┼──── stream ──────▶│        ▼               │
+  │ failure modes          │  (consumer group) │  NodeRunner            │
+  │ RunGraph (one owner)   │                   │   retry / timeout      │
+  │ derive RunState        │◀─── results ──────┤   permits / budget     │
+  └──────────┬─────────────┘  stream per run   └──────────┬─────────────┘
+             │                                            │
+             └──────────────▶ Postgres StateStore ◀────────┘
+                       state, outputs, model calls, definition
+```
+
+**What changed: one seam, two implementations.** The executor's loop used to call
+`asyncio.create_task` inline. It now calls a `Dispatcher` — `LocalDispatcher` spawns a task
+on this loop, `QueueDispatcher` posts a message and waits. Everything that made a node run
+correctly moved to `runtime/node.py` as `NodeRunner`, unchanged, so a worker gets the retry
+loop, the timeout, the dual-axis permits, the budget metering, the recording wrapper and
+the write ordering by construction rather than by reimplementation. `executor.py` went from
+720 lines doing two jobs to a scheduler that does one.
+
+**What did not change, and this is the payoff.** `dagent/graph` was not touched: validation,
+cycle detection, `ready_set`, `descendants`, `expand_workflow` are the same pure functions,
+still with no async and no I/O. `dagent/policy` was not touched. The three failure modes,
+the budget, the backoff and jitter, the idempotency key, `resume`, and the run-state
+derivation are all shared code. There is exactly one run loop, and a distributed run and a
+single-process run go through it identically — which is what
+`test_a_distributed_run_produces_exactly_what_a_single_process_run_produces` asserts,
+node state by node state and output by output.
+
+**At-least-once is safe because Phase 5 made it safe.** A work message *is* the idempotency
+key `(run_id, node_id, attempt)` and carries nothing else — not the node, not its inputs,
+because those live in the store and a message carrying them would be a second source of
+truth that disagrees the first time a planner expands anything. A worker killed mid-node
+leaves its message pending in the consumer group; another worker's `XAUTOCLAIM` takes it
+over, keeping the message id, and re-runs it *at the same attempt*. So the node comes back
+under the key the outside world has already seen, and an agent that deduplicates on
+`ctx.idempotency_key` commits exactly once. That is DR-4 being cashed in: the investment
+was made four phases before the feature that needed it.
+
+Verified against real infrastructure rather than asserted — Redis 7.4, Postgres 16, three
+OS processes, `kill -9` on the one holding a node:
+
+```
+=== every execution of the agent body ===        === effects actually committed ===
+kd2:slow_a:0 pid=35741 started                   kd2_slow_a_0
+kd2:slow_a:0 pid=35741 committed   <- then SIGKILL, before it could report
+kd2:slow_a:0 pid=35742 started     <- taken over, same attempt
+kd2:slow_a:0 pid=35742 already committed         kd2_slow_b_0
+...                                              kd2_slow_c_0
+coordinator run=kd2 state=succeeded              (4 executions, 3 commits)
+```
+
+**Three things genuinely got harder, stated rather than glossed over.**
+
+*The graph still has exactly one owner.* A planner can run on any worker, but a worker
+cannot merge its own expansion: the copy of the workflow it loaded may already be stale,
+because another worker's planner may have grown it since. So the request rides home on the
+result and the coordinator — the one process looking at a graph nobody else is editing —
+validates and merges it. A rejected expansion still fails only the node that asked, one hop
+later than before. Results are acknowledged *after* being merged, not on receipt, so a
+coordinator that dies holding an unmerged expansion gets the report again on resume. That
+window was a real bug, found by a test written from the requirement: `resume` had nothing
+outstanding, concluded the run was finished, and reported success having silently dropped
+the fan-out. `Dispatcher.start` now returns what the last coordinator never acknowledged.
+
+*`fail_fast` degrades honestly.* A coroutine in another process cannot be cancelled, so the
+mode stops dispatching and waits for the siblings already out there, then records what they
+actually did. Writing "cancelled" for a node a worker was still running would put a
+falsehood in the store to preserve a word.
+
+*A token budget is now per worker, not per run.* Nothing sums spending across processes.
+Concurrency caps are per worker by design — each process gets its own slice of the
+provider's rate limit — but a run-wide ceiling would need the coordinator to admit calls,
+and that is a round trip per model call. Documented, not pretended.
+
+**One bug only distribution could find.** `PostgresStateStore.connect` ran
+`CREATE TABLE IF NOT EXISTS`, which looks like a concurrency guarantee and is not: two
+connections that both find a table missing both try to create it, and the loser gets a
+unique-violation from Postgres' catalogue. Invisible while exactly one process ever
+connected; it fired on the first real two-worker run, when the pool came up together. Now
+serialized on an advisory lock, with a test that opens the store eight times at once.
+
+```bash
+# terminal 1..N — workers are interchangeable and none is in charge
+uv run --env-file .env dagent worker --queue redis --store postgres
+
+# terminal 0 — the coordinator: validates, schedules, owns the graph, runs no agents
+uv run --env-file .env dagent run examples/research_dynamic.yaml \
+  --run-id live-1 --queue redis --store postgres
+```
 
 ## Performance, and the bottleneck it found
 
@@ -126,9 +225,12 @@ the constant factor.
 
 Everything the executor does is a loop: compute the ready set → acquire concurrency
 permits → dispatch → on completion persist state and recompute the ready set → repeat
-until the graph is terminal. Full component-by-component detail, the hard problems
-(durable resume, dynamic expansion, backpressure, deterministic replay), and the v1→v2
-scaling path live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+until the graph is terminal. That is the single-process shape; the distributed one differs
+at exactly one arrow, and is drawn above under
+[Distributed workers](#distributed-workers--and-what-did-not-change). Full
+component-by-component detail and the hard problems (durable resume, dynamic expansion,
+backpressure, deterministic replay) live in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Installation
 
@@ -138,8 +240,12 @@ Requires Python 3.11+ and [`uv`](https://docs.astral.sh/uv/).
 git clone https://github.com/inno-mix/dagent.git
 cd dagent
 uv sync                # installs into .venv from pyproject.toml / uv.lock
-cp .env.example .env   # then fill in provider keys once Phase 3 needs them
+cp .env.example .env   # then fill in provider keys
 ```
+
+Nothing above needs a database or a broker: a single-process run uses neither. The two
+extras are opt-in, on the same terms — `uv sync --extra postgres` for durable state,
+`--extra redis` for distributed workers.
 
 ## Quick start
 
@@ -149,12 +255,15 @@ Run the test suite to confirm the install works:
 uv run pytest
 ```
 
-Build and validate a workflow (currently the only executable surface — the async
-executor lands in Phase 2):
+Build a workflow and run it. No provider needed — `fake` agents do no I/O:
 
 ```python
-from dagent.graph import WorkflowBuilder, ready_set
-from dagent.models import NodeState
+import asyncio
+
+import dagent.agents  # registers the built-in agents by name; the core never imports them
+from dagent.graph import WorkflowBuilder
+from dagent.runtime import Executor, default_registry
+from dagent.store import InMemoryStateStore
 
 workflow = (
     WorkflowBuilder("diamond")
@@ -165,18 +274,44 @@ workflow = (
     .build()
 )
 
-states = {node.id: NodeState.PENDING for node in workflow.nodes}
-ready_set(workflow, states)  # ("plan",)
+run = asyncio.run(
+    Executor(registry=default_registry, store=InMemoryStateStore()).run(workflow, run_id="r1")
+)
+print(run.state)  # RunState.SUCCEEDED — with research_a and research_b genuinely concurrent
 ```
 
 An `inputs` entry both feeds a node and makes it wait: the builder adds each input's
 source to that node's dependencies, and validation rejects any input that reads from a
 node the reader does not wait for, because that is a race.
 
-The `dagent` CLI is also installed as a script:
+From the command line, against a real provider:
 
 ```bash
-uv run dagent version
+uv run --env-file .env dagent run examples/research_dynamic.yaml --run-id r1
+```
+
+`research_dynamic.yaml` writes down two nodes. The planner reads the question, decides how
+many researchers the answer needs, and grows the graph at run time — which is why the
+definition is persisted with the run rather than reloaded from the file.
+
+Point it at Postgres and the run outlives the process, which is what `resume` and `inspect`
+need — a run whose state died with the process that produced it is not a run you can ask
+about afterwards:
+
+```bash
+export DAGENT_POSTGRES_DSN=postgresql://...
+uv run --env-file .env dagent run examples/research_dynamic.yaml --run-id r2 --store postgres
+uv run dagent resume r2      # if that was interrupted: continue it, at the same attempt
+uv run dagent inspect r2     # every node, timing, output and model call, as JSON
+```
+
+Same workflow across machines — one coordinator, as many workers as you like:
+
+```bash
+export DAGENT_REDIS_URL=redis://...
+uv run --env-file .env dagent worker --queue redis --store postgres    # in each worker
+uv run --env-file .env dagent run examples/research_dynamic.yaml \
+  --run-id r3 --queue redis --store postgres                           # the coordinator
 ```
 
 ## Core concepts
@@ -195,15 +330,22 @@ uv run dagent version
 dagent/
   models/        # frozen pydantic workflow + state schemas (no logic)
   graph/         # validation (cycles, input satisfaction), topo/ready-set, typed builder
-  runtime/       # agent contract, registry, the async executor
+  runtime/       # agent contract, registry, the coordinator, the node runner, the worker
   policy/        # retry/backoff, timeouts, concurrency + budget limits
   store/         # StateStore protocol + memory/postgres impls
+  transport/     # WorkQueue protocol + memory/redis impls (the v2 work channel)
   agents/        # concrete LLM agents (planner/researcher/synthesizer/critic)
   observability/ # tracing, metrics, structured logging setup
   errors.py      # exception hierarchy
+  loader.py      # YAML workflow files -> Workflow
   cli.py         # typer entrypoint
 tests/           # mirrors the package layout
+benchmarks/      # the load driver behind the performance section
 ```
+
+Inside `runtime/`, the split that made Phase 8 possible: `executor.py` schedules a graph,
+`node.py` runs a single node, `dispatch.py` is the seam between them, and `worker.py` is
+`node.py` with a queue in front of it.
 
 ## Development
 

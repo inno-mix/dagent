@@ -7,12 +7,13 @@ already owns that basename, and pytest identifies test modules by basename alone
 import ast
 import inspect
 import textwrap
+from collections.abc import Sequence
 
 import pytest
 
 from dagent.errors import ValidationError
 from dagent.graph.builder import build_node
-from dagent.models.workflow import Workflow
+from dagent.models.workflow import Node, Workflow
 from dagent.runtime.expansion import Expansion, RunGraph
 
 KNOWN = {"fake"}
@@ -36,10 +37,13 @@ def base() -> Workflow:
     return Workflow(name="base", nodes=(build_node("root", "fake"),))
 
 
-def asking_for(*nodes: object) -> Expansion:
+def asking_for(*nodes: object) -> Sequence[Node]:
+    # Still routed through `Expansion`, which is what an agent actually fills in, even
+    # though `apply` now takes the nodes themselves — a request does not always arrive on
+    # the object that collected it once a worker in another process can raise one.
     expansion = Expansion()
     expansion.add(*nodes)  # type: ignore[arg-type]
-    return expansion
+    return expansion.nodes
 
 
 def graph_for(workflow: Workflow | None = None, **kwargs: object) -> RunGraph:
@@ -95,7 +99,7 @@ def test_an_empty_request_changes_nothing() -> None:
     graph = graph_for()
     before = graph.workflow
 
-    assert graph.apply("root", Expansion()) == ()
+    assert graph.apply("root", ()) == ()
     assert graph.workflow is before
 
 

@@ -211,12 +211,25 @@ ALLOWED_DEPENDENCIES = {
     "graph": frozenset({"errors", "models", "graph"}),
     "policy": frozenset({"errors", "models", "policy"}),
     "store": frozenset({"errors", "models", "store"}),
+    # `transport` sits beside `store`, not above it: both are things the runtime talks to,
+    # and neither knows the other exists. A work queue that could reach the state store
+    # would be a second writer of run state, which is the bug DR-12 is arranged to prevent.
+    "transport": frozenset({"errors", "models", "transport"}),
     # `observability` sits above `store` — the run inspector reads one — and below
     # `runtime`, which emits through it. Signals only ever travel one way: nothing here
     # can change what a run does, which is why the executor may depend on it at all.
     "observability": frozenset({"errors", "models", "store", "observability"}),
     "runtime": frozenset(
-        {"errors", "models", "graph", "policy", "store", "observability", "runtime"}
+        {
+            "errors",
+            "models",
+            "graph",
+            "policy",
+            "store",
+            "transport",
+            "observability",
+            "runtime",
+        }
     ),
 }
 
@@ -255,6 +268,9 @@ def test_the_layering_scan_actually_covers_files() -> None:
 
 OPTIONAL_DEPENDENCIES = {
     "asyncpg": "dagent/store/postgres.py",
+    # The Phase 8 transport, on the same terms as the Phase 5 store: a single-process run
+    # reaches for no broker, so importing dagent must not require one to be installed.
+    "redis": "dagent/transport/redis.py",
     # OpenTelemetry's *API* is a base dependency and does nothing on its own; the SDK and
     # the exporters are the `otel` extra. Only `setup.py` may reach for them, and only
     # when called — which is what lets every other module emit signals unconditionally.

@@ -14,7 +14,7 @@ suspension point *is* the serialisation ARCHITECTURE §4 promises.
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 
 from dagent.errors import ValidationError
@@ -122,15 +122,20 @@ class RunGraph:
             self._index = GraphIndex.of(self._workflow)
         return self._index
 
-    def apply(self, source: str, expansion: Expansion) -> tuple[Node, ...]:
+    def apply(self, source: str, nodes: Sequence[Node]) -> tuple[Node, ...]:
         """Validate an expansion and merge it, or reject it whole.
 
         Deliberately synchronous. See the module docstring: no ``await`` here is what
         makes this atomic on one event loop.
 
+        Takes the nodes rather than the :class:`Expansion` that collected them, because a
+        request does not always arrive on the object an agent filled in: in a distributed
+        run the agent ran in another process and its request came home over the wire. The
+        rule being applied is the same either way, which is the point.
+
         Args:
             source: The node that asked, which is what bounds the expansion's depth.
-            expansion: What it asked for.
+            nodes: What it asked for.
 
         Returns:
             The nodes actually added — empty when the request only restated nodes the
@@ -143,7 +148,7 @@ class RunGraph:
                 into an ordinary node failure, which is why a bad planner cannot deadlock
                 a run — it just fails, and the graph carries on without it.
         """
-        if not expansion:
+        if not nodes:
             return ()
 
         depth = self._depth.get(source, 0) + 1
@@ -154,7 +159,7 @@ class RunGraph:
             )
 
         before = nodes_by_id(self._workflow)
-        total = len(before) + len(expansion.nodes)
+        total = len(before) + len(nodes)
         if total > self._max_nodes:
             raise ValidationError(
                 f"node {source!r} would grow the graph to as many as {total} nodes, above "
@@ -164,9 +169,7 @@ class RunGraph:
         # The merge rule itself is pure and lives in `graph`; what this class adds is the
         # run-level context that rule must not depend on — who asked, how deep they are,
         # and how big the graph is allowed to get.
-        augmented = expand_workflow(
-            self._workflow, expansion.nodes, known_agents=self._known_agents
-        )
+        augmented = expand_workflow(self._workflow, nodes, known_agents=self._known_agents)
         if augmented is self._workflow:
             return ()
 

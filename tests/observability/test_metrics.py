@@ -22,8 +22,10 @@ from dagent.policy.retry import Backoff, no_jitter
 from dagent.policy.run import RunPolicy
 from dagent.runtime.agent import AgentContext
 from dagent.runtime.clock import ManualClock
+from dagent.runtime.dispatch import LocalDispatcher
 from dagent.runtime.executor import Executor
 from dagent.runtime.model import StubModelClient
+from dagent.runtime.node import NodeRunner
 from dagent.runtime.registry import AgentRegistry
 from dagent.store.memory import InMemoryStateStore
 
@@ -45,8 +47,16 @@ def instruments(source: InMemoryMetricReader) -> obs_metrics.Metrics:
 
 
 def executor_with(reader: InMemoryMetricReader, **kwargs: Any) -> Executor:
-    executor = Executor(store=InMemoryStateStore(), **kwargs)
-    executor._metrics = instruments(reader)
+    # The six numbers are recorded from two places since Phase 8 — the coordinator records
+    # what it schedules, the node runner records what it runs — so both get the same
+    # instruments and the reader sees one picture, exactly as it would in production where
+    # both resolve the same global meter.
+    store = InMemoryStateStore()
+    shared = instruments(reader)
+    runner = NodeRunner(store=store, **kwargs)
+    runner._metrics = shared
+    executor = Executor(store=store, dispatcher=LocalDispatcher(runner, store=store), **kwargs)
+    executor._metrics = shared
     return executor
 
 

@@ -144,9 +144,10 @@ relevant `.md` doc. Run all three before you claim a task is complete.
 dagent/
   models/        # frozen pydantic workflow + state schemas (no logic)
   graph/         # validation (cycles, input satisfaction), topo/ready-set, typed builder
-  runtime/       # agent contract, registry, the async executor
+  runtime/       # agent contract, registry, the coordinator, the node runner, the worker
   policy/        # retry/backoff, timeouts, concurrency + budget limits
   store/         # StateStore protocol + memory/postgres impls
+  transport/     # WorkQueue protocol + memory/redis impls (the v2 work channel)
   agents/        # concrete LLM agents (planner/researcher/synthesizer/critic)
   observability/ # tracing, metrics, structured logging setup
   errors.py      # exception hierarchy

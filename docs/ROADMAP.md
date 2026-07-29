@@ -135,10 +135,10 @@ fully reconstructs what happened in a run.
 ## Phase 8 — Capstone: distributed workers
 Goal: the scaling story. Same core, different transport.
 
-- [ ] Executor becomes a coordinator that enqueues ready nodes to **Redis Streams**.
-- [ ] Stateless worker process: consume, run agent, write results via the Postgres
+- [x] Executor becomes a coordinator that enqueues ready nodes to **Redis Streams**.
+- [x] Stateless worker process: consume, run agent, write results via the Postgres
       store; consumer groups for at-least-once delivery.
-- [ ] Demonstrate that idempotency (Phase 5) makes at-least-once safe.
+- [x] Demonstrate that idempotency (Phase 5) makes at-least-once safe.
 
 **Acceptance:** the research workflow runs across ≥2 worker processes; killing one
 worker mid-run does not corrupt state or duplicate side effects; a short write-up

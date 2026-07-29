@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import pathlib
 
@@ -7,10 +8,15 @@ from typer.testing import CliRunner
 from dagent import __version__, cli
 from dagent.cli import app
 from dagent.errors import ValidationError
+from dagent.loader import load_workflow_file
+from dagent.models.state import RunState
+from dagent.policy.run import RunPolicy
 from dagent.runtime.executor import Executor
 from dagent.runtime.model import StubModelClient
 from dagent.store import POSTGRES_DSN_ENV
 from dagent.store.memory import InMemoryStateStore
+from dagent.transport import REDIS_URL_ENV
+from dagent.transport.memory import InMemoryWorkQueue
 
 runner = CliRunner()
 
@@ -407,3 +413,96 @@ def test_a_node_timeout_default_is_accepted() -> None:
     )
 
     assert result.exit_code == 0
+
+
+# --- Phase 8: the coordinator/worker split ------------------------------------------------
+
+
+def test_worker_appears_in_the_help() -> None:
+    result = runner.invoke(app, ["--help"])
+
+    assert "worker" in result.output
+
+
+def test_a_worker_without_a_queue_url_says_which_variable_to_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(REDIS_URL_ENV, raising=False)
+
+    result = runner.invoke(app, ["worker", "--store", "memory"])
+
+    assert result.exit_code == 2
+    assert REDIS_URL_ENV in result.output
+
+
+def test_a_worker_refuses_a_queue_it_does_not_recognise() -> None:
+    result = runner.invoke(app, ["worker", "--store", "memory", "--queue", "kafka"])
+
+    assert result.exit_code == 2
+    assert "unknown queue 'kafka'" in result.output
+
+
+def test_a_worker_told_to_use_no_queue_explains_that_it_needs_one() -> None:
+    # `--queue none` is meaningful for `run` — it means "execute here" — and meaningless for
+    # a worker, whose entire job is to take work from somewhere else.
+    result = runner.invoke(app, ["worker", "--store", "memory", "--queue", "none"])
+
+    assert result.exit_code == 2
+    assert "a worker needs a queue" in result.output
+
+
+def test_a_worker_rejects_an_impossible_node_default_before_connecting() -> None:
+    result = runner.invoke(app, ["worker", "--store", "memory", "--max-attempts", "0"])
+
+    assert result.exit_code == 2
+    assert "invalid node defaults" in result.output
+
+
+def test_a_worker_runs_the_nodes_a_coordinator_hands_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    # One store and one queue shared between the two commands, which is exactly the coupling
+    # two real processes have. The worker exits on `--limit`, so this is a scripted run of
+    # the real CLI paths rather than a fake of them.
+    store = InMemoryStateStore()
+    queue = InMemoryWorkQueue()
+    monkeypatch.setattr(cli, "_open_store", _returning(store))
+    monkeypatch.setattr(cli, "_open_queue", _returning(queue))
+
+    async def both() -> tuple[int, int]:
+        worker = asyncio.create_task(
+            cli._work(
+                name="w1",
+                provider="stub",
+                store="memory",
+                queue="memory",
+                policy=RunPolicy(),
+                reclaim_after=5.0,
+                poll=0.01,
+                limit=5,
+            )
+        )
+        coordinator = await cli._drive(
+            cli._start(load_workflow_file(pathlib.Path(EXAMPLE)), run_id="cli-dist"),
+            run_id="cli-dist",
+            provider="stub",
+            store="memory",
+            queue="memory",
+            show_outputs=False,
+            policy=RunPolicy(),
+        )
+        return coordinator, await worker
+
+    coordinator_code, worker_code = asyncio.run(both())
+
+    assert (coordinator_code, worker_code) == (0, 0)
+    run = asyncio.run(store.load_run("cli-dist"))
+    assert run.state is RunState.SUCCEEDED
+    assert len(run.nodes) == 5
+
+
+def _returning(value: object) -> object:
+    """A stand-in for an `_open_*` helper that hands back an already-built resource."""
+
+    async def opener(kind: str) -> object:
+        return value
+
+    return opener
