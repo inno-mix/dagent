@@ -437,6 +437,19 @@ agent `run(ctx)` executes → output serialized and persisted → state → `SUC
 ready set recomputed. A failure instead flows through retry; exhausted retries set
 `FAILED` and the run's failure semantics decide siblings/downstream.
 
+Across processes the same sequence has one hop inserted and nothing taken out:
+
+`ready_set` picks node → coordinator marks it `READY`, persists that, and submits
+`(run_id, node_id, attempt)` → a worker claims it, reads the definition and the upstream
+outputs *from the store*, builds `AgentContext`, and runs it under the same policy wrapper →
+output and terminal state persisted → result published with any expansion the node
+requested → work entry acknowledged → coordinator folds the result in, merges and persists
+any expansion, acknowledges the result, recomputes the ready set.
+
+The message carries the idempotency key and nothing else. Not the node, not its inputs, not
+the workflow: all of that is already in the store, and a message that carried it would be a
+second source of truth that disagrees with the first the moment a planner expands anything.
+
 ## 6. Scaling path (v1 → v2), as executed
 
 v1 was one process. v2 replaces the in-process task dispatch with a **Redis Streams** work
@@ -466,19 +479,6 @@ worker that requested it (DR-12). `fail_fast` cannot cancel a coroutine in anoth
 so it drains instead and reports what the siblings actually did. And a *token ceiling* is now
 enforced per worker rather than per run, because nothing sums spending across processes;
 concurrency caps being per worker is the desirable half of the same fact.
-
-## 6a. Data flow for one node, distributed
-
-`ready_set` picks node → coordinator marks it `READY`, persists that, and submits
-`(run_id, node_id, attempt)` → a worker claims it, reads the definition and the upstream
-outputs *from the store*, builds `AgentContext`, and runs it under the same policy wrapper →
-output and terminal state persisted → result published with any expansion the node
-requested → work entry acknowledged → coordinator folds the result in, merges and persists
-any expansion, acknowledges the result, recomputes the ready set.
-
-The message carries the idempotency key and nothing else. Not the node, not its inputs, not
-the workflow: all of that is already in the store, and a message that carried it would be a
-second source of truth that disagrees with the first the moment a planner expands anything.
 
 ## 7. Decision records
 

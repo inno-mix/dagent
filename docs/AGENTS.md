@@ -56,7 +56,16 @@ uv run ruff check .          # lint
 uv run ruff format .         # format (do NOT hand-format)
 uv run mypy dagent           # type check — must be clean, no new ignores
 uv run dagent run examples/research.yaml   # run a workflow end to end
+
+# distributed: a coordinator and as many workers as you like, same store and queue
+uv run dagent worker --queue redis --store postgres
+uv run dagent run examples/research_dynamic.yaml --queue redis --store postgres
 ```
+
+The Postgres store and the Redis transport are **skipped** unless
+`DAGENT_TEST_POSTGRES_DSN` and `DAGENT_TEST_REDIS_URL` are set, so a green local run
+proves less than a green CI run. If you touch `store/` or `transport/`, start the
+services and run the suite with both set — CI does, and fails if either was skipped.
 
 **Definition of done for any task:** `pytest`, `ruff check`, and `mypy` all pass
 clean, the new behavior has tests, and any public API change is reflected in the
@@ -68,7 +77,10 @@ relevant `.md` doc. Run all three before you claim a task is complete.
 - **Models/validation:** `pydantic` v2 for all workflow, node, and config schemas.
 - **Persistence:** `StateStore` protocol with an in-memory impl (v1) and Postgres
   via `asyncpg` (v2). Code against the protocol, never a concrete store.
-- **Transport (v2 scaling):** Redis Streams for distributed workers.
+- **Transport:** `WorkQueue` protocol with an in-memory impl and Redis Streams via
+  `redis` (v2). Code against the protocol, never a concrete queue. Both the store and
+  the transport are opt-in extras: a single-process run must stay possible with neither
+  installed, which `tests/test_isolation.py` enforces per module.
 - **Observability:** OpenTelemetry (traces + metrics), structured logs via `structlog`.
 - **HTTP to providers:** `httpx.AsyncClient`, one shared client, never per-call.
 - **CLI:** `typer`.
@@ -80,7 +92,8 @@ relevant `.md` doc. Run all three before you claim a task is complete.
 - **Typing is mandatory.** Full annotations on every public function. `mypy` clean.
   Prefer `Protocol` for extension points over inheritance.
 - **Errors are typed.** Define a small exception hierarchy in `dagent/errors.py`
-  (`DagentError` → `ValidationError`, `PolicyError`, `AgentError`, `StoreError`).
+  (`DagentError` → `ValidationError`, `PolicyError`, `AgentError`, `StoreError`,
+  `TransportError`).
   Never raise bare `Exception`; never `except Exception: pass`.
 - **Immutability at boundaries.** Workflow definitions are frozen models. Runtime
   state is mutated only through the `StateStore`, never by reaching into objects.
@@ -103,6 +116,14 @@ relevant `.md` doc. Run all three before you claim a task is complete.
   twice and the final result is identical to the uninterrupted run.
 - Property-based tests (`hypothesis`) for graph validation: random DAGs in →
   topo order out, random graphs with a cycle in → `ValidationError` out.
+- **Two implementations of a protocol means one conformance suite, not two test files.**
+  `tests/store/test_conformance.py` and `tests/transport/test_queue_conformance.py` run
+  the same contract against every impl; anything impl-specific goes in its own file.
+  "It is swappable" is only worth claiming if two of them are actually held to one rule.
+- **Distributed tests use worker tasks, not processes** — a suite that forks is a suite
+  that gets skipped. What keeps that honest is that they share only the store and the
+  queue, exactly as processes do. Anything that turns on real process boundaries is
+  verified by hand and recorded in the README, not asserted in the suite.
 - Target coverage on `graph/`, `runtime/`, `policy/`, `store/` is 90%+. Agents and
   CLI can be lower.
 

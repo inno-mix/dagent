@@ -29,6 +29,12 @@ which fails the build if a core module ever imports one.
 - **Stays replayable.** Every source of non-determinism — the clock, model calls — is
   injected, never called directly from core logic, so a recorded run can be replayed
   offline for debugging and tests.
+- **Grows its own graph.** A planner agent decides at run time how many nodes the work
+  needs and adds them; the definition is persisted with the run, so a graph no file
+  describes is still resumable.
+- **Scales out without changing.** The same scheduler runs everything in one process or
+  hands each ready node to a pool of workers over Redis Streams. Validation, the ready
+  set, and the policy layer are the same code either way.
 
 See [`docs/SPEC.md`](docs/SPEC.md) for the full functional specification,
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the system design and the decision
@@ -37,7 +43,8 @@ sequenced phase by phase.
 
 ## Status
 
-Under construction, phase by phase, against [`docs/ROADMAP.md`](docs/ROADMAP.md).
+All eight phases of [`docs/ROADMAP.md`](docs/ROADMAP.md) are complete, each against the
+acceptance criteria written before it started.
 
 | Phase | Goal | Status |
 | --- | --- | --- |
@@ -53,7 +60,7 @@ Under construction, phase by phase, against [`docs/ROADMAP.md`](docs/ROADMAP.md)
 
 ## Distributed workers — and what did *not* change
 
-The last phase moves execution off the coordinator's event loop and onto a pool of
+The capstone phase moves execution off the coordinator's event loop and onto a pool of
 interchangeable worker processes, talking over Redis Streams, with Postgres as the shared
 store. The interesting part of that sentence is how little of the engine it touched.
 
@@ -98,8 +105,30 @@ under the key the outside world has already seen, and an agent that deduplicates
 `ctx.idempotency_key` commits exactly once. That is DR-4 being cashed in: the investment
 was made four phases before the feature that needed it.
 
-Verified against real infrastructure rather than asserted — Redis 7.4, Postgres 16, three
-OS processes, `kill -9` on the one holding a node:
+Verified against real infrastructure rather than asserted. The showcase workflow, live
+against a provider, across two worker processes — two nodes written in the file and four
+the planner decided on while it ran:
+
+```
+$ dagent run examples/research_dynamic.yaml --run-id live-1 --queue redis --store postgres
+run live-1: succeeded
+  question: success            plan.research_1: success
+  plan: success                plan.research_2: success
+  plan.research_0: success     plan.synthesis: success
+
+5 model call(s), 5468 token(s) recorded
+```
+
+A fan-out of four slow nodes, to show the pool is genuinely sharing rather than one process
+draining the queue — 7s wall clock against 12s+ if it had been serial:
+
+```
+=== nodes handled per process ===
+   2 37533
+   3 37534
+```
+
+And a worker killed mid-node with `kill -9` — Redis 7.4, Postgres 16, three OS processes:
 
 ```
 === every execution of the agent body ===        === effects actually committed ===
