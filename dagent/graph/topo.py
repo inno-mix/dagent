@@ -16,6 +16,7 @@ from dagent.models.state import NodeState
 from dagent.models.workflow import Node, Workflow
 
 __all__ = [
+    "dependency_index",
     "descendants",
     "node_dependencies",
     "nodes_by_id",
@@ -121,7 +122,12 @@ def descendants(workflow: Workflow, node_id: str) -> frozenset[str]:
     return frozenset(reached)
 
 
-def ready_set(workflow: Workflow, states: Mapping[str, NodeState]) -> tuple[str, ...]:
+def ready_set(
+    workflow: Workflow,
+    states: Mapping[str, NodeState],
+    *,
+    dependencies: Mapping[str, frozenset[str]] | None = None,
+) -> tuple[str, ...]:
     """Return the ids of every node that can start now, in declaration order.
 
     A node is ready when it is still ``PENDING`` and every node it depends on is
@@ -129,15 +135,36 @@ def ready_set(workflow: Workflow, states: Mapping[str, NodeState]) -> tuple[str,
     just grew (Phase 6) needs no state backfill before it can be scheduled.
 
     Ordered rather than an unordered set on purpose: dispatch order then reproduces on
-    replay. Cost is O(nodes + edges), so recomputing after every completion is cheap.
+    replay. Cost is O(nodes + edges).
+
+    Args:
+        workflow: The definition to schedule from.
+        states: What each node is currently doing.
+        dependencies: A precomputed edge index, as :func:`dependency_index` returns.
+            Optional, and purely a performance seam: the executor calls this once per
+            completion, so building a ``frozenset`` per node per call put two million
+            allocations into a two-thousand-node run and made this function 82% of the
+            engine's own cost. Passing an index that only changes when the graph does
+            removes them. Omit it and the answer is identical, just slower.
     """
+    edges = dependencies if dependencies is not None else dependency_index(workflow)
     ready: list[str] = []
     for node in workflow.nodes:
         if states.get(node.id, NodeState.PENDING) != NodeState.PENDING:
             continue
         if all(
             states.get(dependency, NodeState.PENDING) == NodeState.SUCCESS
-            for dependency in node_dependencies(node)
+            for dependency in edges[node.id]
         ):
             ready.append(node.id)
     return tuple(ready)
+
+
+def dependency_index(workflow: Workflow) -> dict[str, frozenset[str]]:
+    """Every node's edge set, computed once.
+
+    One definition of the edge set still — this is :func:`node_dependencies` applied to
+    each node — but materialised, so a caller looping over a graph does not rebuild it on
+    every pass.
+    """
+    return {node.id: node_dependencies(node) for node in workflow.nodes}

@@ -84,7 +84,8 @@ ignore = [
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["D"] # test names are the documentation
+"tests/*" = ["D"]      # test names are the documentation
+"benchmarks/*" = ["D"] # a driver, not library surface
 
 [tool.mypy]
 python_version = "3.11"

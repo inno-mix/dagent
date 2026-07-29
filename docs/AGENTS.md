@@ -154,6 +154,7 @@ dagent/
   cli.py         # typer entrypoint
 tests/           # mirrors the package layout
 examples/        # sample workflow definitions (yaml)
+benchmarks/      # the load driver behind the README's performance section
 ```
 
 Keep this map accurate. If you move something, update this section and

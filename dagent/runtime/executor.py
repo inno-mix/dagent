@@ -251,13 +251,13 @@ class Executor:
         """
         halted = False
         while True:
-            workflow = graph.workflow
-            nodes = nodes_by_id(workflow)
-            # Declaration order, so a batch of completions is folded in the same
-            # sequence every time — see the comment where `declared` is used below.
-            declared = {node_id: index for index, node_id in enumerate(nodes)}
+            # Derived once per graph version rather than per pass: an expansion
+            # replaces the workflow object, so the index invalidates itself by identity.
+            # Rebuilding these every pass is what made the loop quadratic in node count.
+            index = graph.index
+            workflow, nodes, declared = index.workflow, index.nodes, index.declared
 
-            ready = () if halted else ready_set(workflow, states)
+            ready = () if halted else ready_set(workflow, states, dependencies=index.dependencies)
             self._metrics.ready_set_size.record(len(ready), {obs_metrics.WORKFLOW: workflow.name})
             for node_id in ready:
                 # Mark READY before dispatching: ready_set only offers PENDING

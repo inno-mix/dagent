@@ -51,6 +51,53 @@ Under construction, phase by phase, against [`docs/ROADMAP.md`](docs/ROADMAP.md)
 | 7 — Observability + run inspector | Tracing, metrics, and a CLI `inspect` command | Done |
 | 8 — Capstone: distributed workers | Same core, Redis Streams transport, Postgres store | Next |
 
+## Performance, and the bottleneck it found
+
+SPEC's target is that the engine's own overhead — everything that is not waiting for a
+model — stays "under a few milliseconds per node at 100 concurrent nodes on a laptop."
+`benchmarks/load.py` measures exactly that, with an agent that does nothing at all, so
+every microsecond it reports belongs to scheduling, validation, state transitions, store
+writes and instrumentation.
+
+```
+uv run python benchmarks/load.py
+
+shape      nodes  total (s)  per node (ms)
+-------------------------------------------
+wide         100     0.0048         0.0475     <- the target: 60x under budget
+wide        2000     0.1403         0.0702
+chain        100     0.0114         0.1140
+chain       2000     1.1346         0.5673     <- the pathological shape
+layered     2000     0.4250         0.2125
+```
+
+The target is met with room to spare, and with 50 ms of simulated model latency the
+engine disappears entirely: 100 nodes finish in 166 ms — three sequential waves of 50 ms —
+and 500 nodes finish in the same wall time, which is what "runs independent nodes
+concurrently" is supposed to mean.
+
+**The bottleneck was `ready_set`, at 82% of engine time.** Profiling a 2,000-node chain
+showed it recomputing the entire ready set on every pass of the run loop: 2,001 passes ×
+2,000 nodes, two million `frozenset` allocations, six million dictionary lookups. Two
+things were wrong. The loop was rebuilding its node index, its declaration-order map and
+every node's edge set on each pass, none of which change unless the graph does — so those
+are now derived once per graph *version*, held against the `Workflow` object itself and
+invalidated by identity when an expansion replaces it. That took the pathological case
+from 1.64 s to 1.13 s, a 31% cut, and left the target case unchanged because it was never
+the problem there.
+
+What remains is algorithmic and worth naming precisely rather than hiding. Recomputing
+readiness from scratch after each completion is O(V+E) per pass, so a graph that completes
+one node at a time costs O(V²) overall — visible above as `chain`'s per-node figure rising
+with size while `wide`'s stays flat. It does not breach the target at any size measured,
+and it only bites on graphs with no concurrency, which is the shape this engine is least
+useful for. The fix, when a workload demands it, is the standard one: keep a count of each
+node's unfinished dependencies and decrement it on completion, turning the whole run into
+O(V+E) instead of O(V+E) per pass. That is deliberately not done yet — it is surgery on
+the most delicate code in the project to serve a workload SPEC does not describe, and
+`ready_set` staying a pure function of the graph and the states is worth more today than
+the constant factor.
+
 ## Architecture at a glance
 
 ```

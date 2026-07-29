@@ -19,10 +19,38 @@ from dataclasses import dataclass, field
 
 from dagent.errors import ValidationError
 from dagent.graph.expansion import expand_workflow
-from dagent.graph.topo import nodes_by_id
+from dagent.graph.topo import dependency_index, nodes_by_id
 from dagent.models.workflow import Node, Workflow
 
-__all__ = ["Expansion", "RunGraph"]
+__all__ = ["Expansion", "GraphIndex", "RunGraph"]
+
+
+@dataclass(frozen=True, slots=True)
+class GraphIndex:
+    """What the run loop needs to know about a graph, computed once per version.
+
+    Held against the exact ``Workflow`` object it describes, so an expansion — which
+    replaces that object rather than editing it — invalidates the index by identity and
+    nothing has to remember to.
+    """
+
+    workflow: Workflow
+    nodes: dict[str, Node]
+    dependencies: dict[str, frozenset[str]]
+    declared: dict[str, int]
+    """Each node's position in declaration order — the tiebreak the loop folds
+    completions in, so a batch of them is applied in the same sequence every time."""
+
+    @classmethod
+    def of(cls, workflow: Workflow) -> GraphIndex:
+        """Derive the index for one version of a graph."""
+        nodes = nodes_by_id(workflow)
+        return cls(
+            workflow=workflow,
+            nodes=nodes,
+            dependencies=dependency_index(workflow),
+            declared={node_id: index for index, node_id in enumerate(nodes)},
+        )
 
 
 @dataclass(slots=True)
@@ -75,11 +103,24 @@ class RunGraph:
         self._max_depth = max_depth
         self._max_nodes = max_nodes
         self._depth: dict[str, int] = dict.fromkeys(nodes_by_id(workflow), 0)
+        self._index: GraphIndex | None = None
 
     @property
     def workflow(self) -> Workflow:
         """The definition as it stands now."""
         return self._workflow
+
+    @property
+    def index(self) -> GraphIndex:
+        """The three things the run loop derives from the graph, derived once.
+
+        Rebuilt only when an expansion replaces the workflow. The loop consults these on
+        every pass, and recomputing them each time made the scheduler quadratic in the
+        node count — see the load test in ``benchmarks/load.py``.
+        """
+        if self._index is None or self._index.workflow is not self._workflow:
+            self._index = GraphIndex.of(self._workflow)
+        return self._index
 
     def apply(self, source: str, expansion: Expansion) -> tuple[Node, ...]:
         """Validate an expansion and merge it, or reject it whole.
