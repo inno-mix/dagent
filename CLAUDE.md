@@ -138,7 +138,7 @@ deliberate exception (DR-10): only the event loop can cancel at a deadline.
 ## Current state
 
 All eight roadmap phases are complete: 1005 tests offline / 1088 with services, 99%
-coverage, ruff and mypy clean. Two things remain open and are documented rather than hidden:
-CI has never actually run (there is no remote, so Phase 0's "CI green" criterion is formally
-unmet), and the incremental ready-set frontier is deliberately deferred — the README names
-the threshold, the measured cost, and the fix.
+coverage, ruff and mypy clean. CI runs on push against `github.com/inno-mix/dagent` and is
+green. One thing remains open and is documented rather than hidden: the incremental
+ready-set frontier is deliberately deferred — the README names the threshold, the measured
+cost, and the fix.
